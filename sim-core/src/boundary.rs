@@ -123,13 +123,13 @@ impl DomainBoundaryConfig {
     }
 
     /// Coastal beach scenario: wave generator on the South (ocean) edge,
-    /// absorbing drains on East/West flanks, solid wall on upper North beach.
+    /// solid reflective walls on North/East/West flanks so waves surge forward without leaking sideways.
     pub fn coastal_waves(wave_gen: EdgeBoundary) -> Self {
         Self {
             north: EdgeBoundary::SolidWall,
             south: wave_gen,
-            east: EdgeBoundary::OpenOutflow { absorption_rate: 0.85 },
-            west: EdgeBoundary::OpenOutflow { absorption_rate: 0.85 },
+            east: EdgeBoundary::SolidWall,
+            west: EdgeBoundary::SolidWall,
         }
     }
 

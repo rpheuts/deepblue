@@ -174,9 +174,33 @@ fn compute_hillshade_parallel(z_bed: &[f32], shade_cache: &mut [f32], width: usi
 
 #[macroquad::main("DeepBlue Hydraulic Sandbox")]
 async fn main() {
-    let desc = SimDomainDescriptor {
-        grid_res_x: 512,
-        grid_res_y: 512,
+    // Read command line argument or environment variable for initial grid resolution
+    let initial_grid_res: u32 = std::env::var("GRID_RES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .or_else(|| {
+            let args: Vec<String> = std::env::args().collect();
+            for i in 1..args.len() {
+                if args[i] == "--res" || args[i] == "-r" || args[i] == "--grid" {
+                    if let Some(val) = args.get(i + 1) {
+                        if let Ok(num) = val.parse() {
+                            return Some(num);
+                        }
+                    }
+                } else if let Ok(num) = args[i].parse() {
+                    return Some(num);
+                }
+            }
+            None
+        })
+        .unwrap_or(512)
+        .clamp(64, 4096);
+
+    let initial_grid_res = (initial_grid_res / 16) * 16;
+
+    let mut desc = SimDomainDescriptor {
+        grid_res_x: initial_grid_res,
+        grid_res_y: initial_grid_res,
         extent_x: 100.0,
         extent_y: 100.0,
         ..Default::default()
@@ -195,7 +219,7 @@ async fn main() {
 
     // Fast texture blitting buffer
     let mut img = Image::gen_image_color(desc.grid_res_x as u16, desc.grid_res_y as u16, BLACK);
-    let texture = Texture2D::from_image(&img);
+    let mut texture = Texture2D::from_image(&img);
     texture.set_filter(FilterMode::Linear);
 
     // Cached hillshade and telemetry buffers to eliminate single-core CPU stalls
@@ -300,6 +324,46 @@ async fn main() {
                 respawn_particle(p, sim.current_state(), &mut rng, desc.grid_res_x, desc.grid_res_y);
             }
             bed_dirty = true;
+        } else if is_key_pressed(KeyCode::G) {
+            // Cycle grid density: 256 -> 512 -> 768 -> 1024 -> 2048
+            let shift = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
+            let densities = [256, 512, 768, 1024, 2048];
+            let cur_idx = densities
+                .iter()
+                .position(|&r| r == desc.grid_res_x)
+                .unwrap_or(1);
+            let next_idx = if shift {
+                if cur_idx == 0 { densities.len() - 1 } else { cur_idx - 1 }
+            } else {
+                (cur_idx + 1) % densities.len()
+            };
+            let new_res = densities[next_idx];
+            desc.grid_res_x = new_res;
+            desc.grid_res_y = new_res;
+
+            let grid = match current_preset {
+                ActivePreset::BeachStream => Scenarios::beach_stream(desc),
+                ActivePreset::BeachWaves => Scenarios::beach_sandcastle_waves(desc),
+                ActivePreset::DamBreak => Scenarios::dam_break(desc),
+                ActivePreset::LakeAtRest => Scenarios::lake_at_rest(desc),
+            };
+
+            sim = if is_gpu {
+                Box::new(WgpuSimulator::new(grid).await)
+            } else {
+                Box::new(CpuSimulator::new(grid))
+            };
+
+            img = Image::gen_image_color(new_res as u16, new_res as u16, BLACK);
+            texture = Texture2D::from_image(&img);
+            texture.set_filter(FilterMode::Linear);
+            shade_cache = vec![1.0f32; (new_res * new_res) as usize];
+            bed_dirty = true;
+            camera = CameraState::new();
+
+            for p in &mut particles {
+                respawn_particle(p, sim.current_state(), &mut rng, desc.grid_res_x, desc.grid_res_y);
+            }
         }
 
         // --- 2. Toggles ---
@@ -379,7 +443,8 @@ async fn main() {
         // --- 4. Interactive Mouse Tools ---
         if mouse_in_window && !is_mouse_button_down(MouseButton::Middle) {
             let (gx, gy) = camera.screen_to_grid(mx, my, screen_width(), screen_height(), desc.grid_res_x as f32, desc.grid_res_y as f32);
-            let radius = (10.0 / camera.zoom.sqrt()).max(3.0) as i32;
+            let base_radius = 10.0 * (desc.grid_res_x as f32 / 512.0);
+            let radius = (base_radius / camera.zoom.sqrt()).max(3.0) as i32;
             let r2 = radius * radius;
 
             let ctrl_down = is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl);
@@ -473,7 +538,8 @@ async fn main() {
             safe_dt = max_cfl_dt;
             // Frame simulation duration clamped to ensure true 1:1 real-time pacing across variable refresh rates
             let frame_sim_time = get_frame_time().clamp(0.003, 0.016);
-            current_sub_dt = frame_sim_time.min(max_cfl_dt.min(0.004));
+            let max_sub_dt = 0.004 * (512.0 / desc.grid_res_x as f32);
+            current_sub_dt = frame_sim_time.min(max_cfl_dt.min(max_sub_dt));
             sim.step_subdivided(frame_sim_time, current_sub_dt);
         }
 
@@ -826,10 +892,17 @@ async fn main() {
 
         // Top bar
         let hud_height = if current_preset == ActivePreset::BeachWaves { 186.0 } else { 166.0 };
-        draw_rectangle(8.0, 8.0, 650.0, hud_height, Color::new(0.0, 0.0, 0.0, 0.84));
+        draw_rectangle(8.0, 8.0, 680.0, hud_height, Color::new(0.0, 0.0, 0.0, 0.84));
 
         draw_text(
-            format!("FPS: {} | Backend: {}", get_fps(), sim.backend_name()).as_str(),
+            format!(
+                "FPS: {} | Backend: {} | Grid: {}x{} ({:.2}M cells)",
+                get_fps(),
+                sim.backend_name(),
+                desc.grid_res_x,
+                desc.grid_res_y,
+                (desc.grid_res_x * desc.grid_res_y) as f32 / 1_000_000.0
+            ).as_str(),
             16.0,
             28.0,
             20.0,
@@ -876,7 +949,7 @@ async fn main() {
         );
 
         draw_text(
-            "Keys: [1..4] Presets ([1] Stream, [2] Waves, [3] Dam, [4] Lake) | [R] Reset | [Space] Swap",
+            "Keys: [1..4] Presets | [G] Density (256..2048) | [R] Reset | [Space] Swap Backend",
             16.0,
             98.0,
             13.0,
@@ -917,7 +990,10 @@ async fn main() {
 
         if current_preset == ActivePreset::BeachWaves {
             let t = sim.sim_time();
-            let wave_period = 15.0f32;
+            let wave_period = match sim.boundaries().south {
+                sim_core::boundary::EdgeBoundary::WaveGenerator { wave_period, .. } => wave_period,
+                _ => 25.0f32,
+            };
             let phase = (t / wave_period).rem_euclid(1.0);
             let tide_phase = (2.0 * std::f32::consts::PI * t / 90.0).sin();
 

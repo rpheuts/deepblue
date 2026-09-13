@@ -169,10 +169,10 @@ impl Scenarios {
         let height = desc.grid_res_y;
 
         let wave_gen = EdgeBoundary::WaveGenerator {
-            base_elevation: 0.12,
-            wave_amplitude: 0.38,
-            wave_period: 15.0,
-            surge_speed: 0.65,
+            base_elevation: 0.15,
+            wave_amplitude: 0.46,
+            wave_period: 25.0,
+            surge_speed: 0.80,
             tide_amplitude: 0.12,
             tide_period: 90.0,
         };
@@ -193,30 +193,30 @@ impl Scenarios {
                 let idx = grid.current.idx(x, y);
 
                 // --- 1. Base Coastline Bathymetry & Elevation ---
-                // North (ny < 0.40): Dunes & backshore (z = 0.6m to 1.8m)
-                // Middle (ny in 0.40..0.72): Intertidal swash zone (z = 0.0m to 0.6m)
-                // South (ny > 0.72): Offshore seabed (z = -0.55m to 0.0m)
-                let mut z = if ny < 0.40 {
-                    let dune_progress = (0.40 - ny) / 0.40;
-                    0.60 + 1.20 * dune_progress.powf(1.2) + 0.08 * (nx * 6.0 * pi).sin() * (ny * 8.0 * pi).cos()
-                } else if ny < 0.72 {
-                    let beach_progress = (0.72 - ny) / 0.32;
-                    beach_progress * 0.60 + 0.03 * (nx * 12.0 * pi).sin()
+                // North (ny < 0.38): Dunes & backshore (z = 0.95m to 2.2m)
+                // Middle (ny in 0.38..0.68): Steeper intertidal swash zone (z = 0.0m to 0.95m, increased pitch)
+                // South (ny > 0.68): Deep offshore seabed (z = -1.45m to 0.0m, >2.3x deeper ocean)
+                let mut z = if ny < 0.38 {
+                    let dune_progress = (0.38 - ny) / 0.38;
+                    0.95 + 1.25 * dune_progress.powf(1.2) + 0.08 * (nx * 6.0 * pi).sin() * (ny * 8.0 * pi).cos()
+                } else if ny < 0.68 {
+                    let beach_progress = (0.68 - ny) / 0.30;
+                    beach_progress * 0.95 + 0.03 * (nx * 12.0 * pi).sin()
                 } else {
-                    let deep_progress = (ny - 0.72) / 0.28;
-                    -0.55 * deep_progress.powf(0.85) + 0.02 * (nx * 8.0 * pi).cos()
+                    let deep_progress = (ny - 0.68) / 0.32;
+                    -1.45 * deep_progress.powf(0.85) + 0.03 * (nx * 8.0 * pi).cos()
                 };
 
                 // Default bedrock: 0.45m below ground level in dunes/beach, or deep in seabed
-                let mut bedrock = (z - 0.45).max(-1.0);
+                let mut bedrock = (z - 0.45).max(-2.5);
 
                 // --- 2. Pre-Built Stone Breakwater / Jetty (West Flank) ---
-                // Extends from ny = 0.38 down to ny = 0.75, width ~ 3.5 meters
+                // Extends from ny = 0.35 down to ny = 0.74, width ~ 3.5 meters
                 let jetty_x = 0.22f32;
                 let jetty_half_w = 0.018f32;
-                if (nx - jetty_x).abs() <= jetty_half_w && (0.38..=0.75).contains(&ny) {
+                if (nx - jetty_x).abs() <= jetty_half_w && (0.35..=0.74).contains(&ny) {
                     // Indestructible stone breakwater / groyne
-                    let stone_height = 1.15f32;
+                    let stone_height = 1.35f32;
                     z = z.max(stone_height);
                     bedrock = z; // bedrock == z_bed makes it indestructible stone!
                 }
@@ -267,8 +267,8 @@ impl Scenarios {
                 grid.next.bedrock_z[idx] = bedrock;
 
                 // --- 4. Initial Water Level ---
-                // Pre-fill ocean (still water level at eta = 0.12m)
-                let still_water_eta = 0.12f32;
+                // Pre-fill ocean (still water level at eta = 0.15m)
+                let still_water_eta = 0.15f32;
                 if still_water_eta > z {
                     let h = still_water_eta - z;
                     grid.current.h[idx] = h;
@@ -278,7 +278,7 @@ impl Scenarios {
                 } else {
                     // Damp sand in swash zone, dry on upper dunes
                     let sat = if ny > 0.48 {
-                        0.55 * ((ny - 0.48) / 0.24).clamp(0.0, 1.0)
+                        0.55 * ((ny - 0.48) / 0.20).clamp(0.0, 1.0)
                     } else {
                         0.05
                     };
