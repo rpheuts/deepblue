@@ -1,6 +1,11 @@
 pub mod domain;
 pub mod state;
 pub mod solver;
+pub mod backend;
+pub mod scenario;
+
+pub use backend::{SimulationBackend, CpuSimulator};
+pub use scenario::Scenarios;
 
 #[cfg(test)]
 mod tests {
@@ -152,4 +157,37 @@ mod tests {
         assert!(grid.current.h[downstream_idx] > 0.1, "Wave front did not advance downstream!");
         assert!(grid.current.u[downstream_idx] > 0.0, "Downstream velocity should be directed forward!");
     }
+
+    #[test]
+    fn test_cpu_simulator_backend_trait() {
+        use crate::backend::{CpuSimulator, SimulationBackend};
+
+        let mut desc = SimDomainDescriptor::default();
+        desc.grid_res_x = 20;
+        desc.grid_res_y = 20;
+        let mut grid = DoubleBufferedGrid::new(desc);
+
+        for y in 5..15 {
+            for x in 5..15 {
+                let idx = grid.current.idx(x, y);
+                grid.current.h[idx] = 2.0;
+            }
+        }
+
+        // Test through trait object
+        let mut sim: Box<dyn SimulationBackend> = Box::new(CpuSimulator::new(grid));
+        assert_eq!(sim.backend_name(), "CPU Reference (sim-core)");
+
+        let initial_mass = sim.total_fluid_mass();
+        assert!(initial_mass > 0.0);
+
+        // Subdivided step
+        sim.step_subdivided(0.1, 0.01);
+        sim.sync_to_cpu();
+
+        let final_mass = sim.total_fluid_mass();
+        let diff = (initial_mass - final_mass).abs();
+        assert!(diff < 1e-3, "Mass not conserved through trait object! Diff: {}", diff);
+    }
 }
+

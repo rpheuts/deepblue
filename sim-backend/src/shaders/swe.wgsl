@@ -31,7 +31,7 @@ fn get_idx(x: u32, y: u32) -> u32 {
 }
 
 fn wave_speed(h: f32, v: f32) -> f32 {
-    return abs(v) + sqrt(G * h);
+    return abs(v) + sqrt(G * max(0.0, h));
 }
 
 fn calc_f(h: f32, u: f32, v: f32) -> vec3<f32> {
@@ -160,8 +160,18 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         u_next = 0.0;
         v_next = 0.0;
     } else {
-        let raw_u = hu_next / h_next;
-        let raw_v = hv_next / h_next;
+        // Desingularized velocity recovery: u = h * (hu) / (h^2 + h_dry^2)
+        let denom = h_next * h_next + h_dry * h_dry;
+        var raw_u = (h_next * hu_next) / denom;
+        var raw_v = (h_next * hv_next) / denom;
+
+        let raw_speed = sqrt(raw_u * raw_u + raw_v * raw_v);
+        let max_speed = 20.0;
+        if (raw_speed > max_speed) {
+            let scale = max_speed / raw_speed;
+            raw_u *= scale;
+            raw_v *= scale;
+        }
 
         // Semi-implicit Manning friction drag
         let speed = sqrt(raw_u * raw_u + raw_v * raw_v);

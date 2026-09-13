@@ -1,4 +1,7 @@
 use sim_core::state::DoubleBufferedGrid;
+use sim_core::backend::SimulationBackend;
+use sim_core::domain::SimDomainDescriptor;
+use sim_core::state::GridState;
 use wgpu::util::DeviceExt;
 use std::borrow::Cow;
 
@@ -10,7 +13,7 @@ pub struct WgpuSimulator {
     bind_group_0: wgpu::BindGroup,
     bind_group_1: wgpu::BindGroup,
     
-    // Cached CPU state for readback
+    // Cached CPU state for readback and interactions
     pub cpu_grid: DoubleBufferedGrid,
     
     // GPU Uniform Buffers
@@ -19,18 +22,21 @@ pub struct WgpuSimulator {
     
     // Ping-pong storage buffers
     buf_h: [wgpu::Buffer; 2],
-    _buf_u: [wgpu::Buffer; 2],
-    _buf_v: [wgpu::Buffer; 2],
-    _buf_z: [wgpu::Buffer; 2],
+    buf_u: [wgpu::Buffer; 2],
+    buf_v: [wgpu::Buffer; 2],
+    buf_z: [wgpu::Buffer; 2],
 
-    // Persistent staging buffer for readback (avoid per-frame allocation)
+    // Persistent staging buffers for readback (avoid per-frame allocation)
     staging_h: wgpu::Buffer,
+    staging_u: wgpu::Buffer,
+    staging_v: wgpu::Buffer,
     buffer_byte_size: u64,
     
     ping_pong: usize,
 }
 
 impl WgpuSimulator {
+    /// Asynchronously initializes a new GPU-accelerated SWE simulator.
     pub async fn new(mut cpu_grid: DoubleBufferedGrid) -> Self {
         // Ensure reflective boundary halo cells are valid on both buffers
         cpu_grid.current.apply_reflective_boundaries();
@@ -159,6 +165,20 @@ impl WgpuSimulator {
             mapped_at_creation: false,
         });
 
+        let staging_u = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Staging Buffer U"),
+            size: buffer_byte_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let staging_v = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Staging Buffer V"),
+            size: buffer_byte_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Self {
             device,
             queue,
@@ -170,21 +190,29 @@ impl WgpuSimulator {
             _buf_domain: buf_domain,
             buf_dt,
             buf_h,
-            _buf_u: buf_u,
-            _buf_v: buf_v,
-            _buf_z: buf_z,
+            buf_u,
+            buf_v,
+            buf_z,
             staging_h,
+            staging_u,
+            staging_v,
             buffer_byte_size,
             ping_pong: 0,
         }
     }
 
+    /// Synchronously initializes the GPU simulator via blocking execution.
+    pub fn new_sync(cpu_grid: DoubleBufferedGrid) -> Self {
+        pollster::block_on(Self::new(cpu_grid))
+    }
+
+    /// Advances the GPU compute simulation forward by a single time step `dt`.
     pub fn step(&mut self, dt: f32) {
         self.queue.write_buffer(&self.buf_dt, 0, bytemuck::bytes_of(&dt));
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        let workgroups_x = (self.cpu_grid.descriptor.grid_res_x + 15) / 16;
-        let workgroups_y = (self.cpu_grid.descriptor.grid_res_y + 15) / 16;
+        let workgroups_x = self.cpu_grid.descriptor.grid_res_x.div_ceil(16);
+        let workgroups_y = self.cpu_grid.descriptor.grid_res_y.div_ceil(16);
 
         // Pass 1: Interior SWE kernel dispatch
         {
@@ -221,8 +249,8 @@ impl WgpuSimulator {
         self.ping_pong = 1 - self.ping_pong;
     }
 
-    pub async fn sync_to_cpu(&mut self) {
-        // The most recently written buffer is indexed by self.ping_pong
+    /// Synchronously reads back the latest fluid depth and velocity fields from GPU to host CPU memory.
+    pub fn sync_to_cpu(&mut self) {
         let out_idx = self.ping_pong;
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -230,22 +258,98 @@ impl WgpuSimulator {
         });
 
         encoder.copy_buffer_to_buffer(&self.buf_h[out_idx], 0, &self.staging_h, 0, self.buffer_byte_size);
+        encoder.copy_buffer_to_buffer(&self.buf_u[out_idx], 0, &self.staging_u, 0, self.buffer_byte_size);
+        encoder.copy_buffer_to_buffer(&self.buf_v[out_idx], 0, &self.staging_v, 0, self.buffer_byte_size);
         self.queue.submit(Some(encoder.finish()));
 
-        let buffer_slice = self.staging_h.slice(..);
+        let slice_h = self.staging_h.slice(..);
+        let slice_u = self.staging_u.slice(..);
+        let slice_v = self.staging_v.slice(..);
+
         let (sender, receiver) = std::sync::mpsc::channel();
-        buffer_slice.map_async(wgpu::MapMode::Read, move |v| sender.send(v).unwrap());
+        let sender_u = sender.clone();
+        let sender_v = sender.clone();
+
+        slice_h.map_async(wgpu::MapMode::Read, move |v| sender.send(v).unwrap());
+        slice_u.map_async(wgpu::MapMode::Read, move |v| sender_u.send(v).unwrap());
+        slice_v.map_async(wgpu::MapMode::Read, move |v| sender_v.send(v).unwrap());
 
         self.device.poll(wgpu::Maintain::Wait);
 
-        if receiver.recv().unwrap().is_ok() {
-            let data = buffer_slice.get_mapped_range();
-            let floats: &[f32] = bytemuck::cast_slice(&data);
-
-            self.cpu_grid.current.h.copy_from_slice(floats);
-            drop(data);
-            self.staging_h.unmap();
+        for _ in 0..3 {
+            let _ = receiver.recv().unwrap();
         }
+
+        {
+            let data_h = slice_h.get_mapped_range();
+            let floats_h: &[f32] = bytemuck::cast_slice(&data_h);
+            self.cpu_grid.current.h.copy_from_slice(floats_h);
+        }
+        self.staging_h.unmap();
+
+        {
+            let data_u = slice_u.get_mapped_range();
+            let floats_u: &[f32] = bytemuck::cast_slice(&data_u);
+            self.cpu_grid.current.u.copy_from_slice(floats_u);
+        }
+        self.staging_u.unmap();
+
+        {
+            let data_v = slice_v.get_mapped_range();
+            let floats_v: &[f32] = bytemuck::cast_slice(&data_v);
+            self.cpu_grid.current.v.copy_from_slice(floats_v);
+        }
+        self.staging_v.unmap();
+    }
+
+    /// Uploads host CPU state modifications to the active GPU compute storage buffers.
+    pub fn upload_state(&mut self) {
+        self.cpu_grid.apply_reflective_boundaries();
+        let in_idx = self.ping_pong;
+        self.queue.write_buffer(&self.buf_h[in_idx], 0, bytemuck::cast_slice(&self.cpu_grid.current.h));
+        self.queue.write_buffer(&self.buf_u[in_idx], 0, bytemuck::cast_slice(&self.cpu_grid.current.u));
+        self.queue.write_buffer(&self.buf_v[in_idx], 0, bytemuck::cast_slice(&self.cpu_grid.current.v));
+        self.queue.write_buffer(&self.buf_z[in_idx], 0, bytemuck::cast_slice(&self.cpu_grid.current.z_bed));
+    }
+}
+
+impl SimulationBackend for WgpuSimulator {
+    fn backend_name(&self) -> &'static str {
+        "GPU (wgpu/WGSL)"
+    }
+
+    fn descriptor(&self) -> &SimDomainDescriptor {
+        &self.cpu_grid.descriptor
+    }
+
+    fn step(&mut self, dt: f32) {
+        self.step(dt);
+    }
+
+    fn sync_to_cpu(&mut self) {
+        self.sync_to_cpu();
+    }
+
+    fn current_state(&self) -> &GridState {
+        &self.cpu_grid.current
+    }
+
+    fn current_state_mut(&mut self) -> &mut GridState {
+        &mut self.cpu_grid.current
+    }
+
+    fn previous_state(&self) -> &GridState {
+        &self.cpu_grid.next
+    }
+
+    fn upload_state(&mut self) {
+        self.upload_state();
+    }
+
+    fn compute_max_stable_dt(&self, cfl: f32) -> f32 {
+        let dx = self.cpu_grid.descriptor.extent_x / self.cpu_grid.descriptor.grid_res_x as f32;
+        let dy = self.cpu_grid.descriptor.extent_y / self.cpu_grid.descriptor.grid_res_y as f32;
+        sim_core::solver::swe::compute_max_stable_dt(&self.cpu_grid.current, dx, dy, cfl, 9.81)
     }
 }
 
@@ -255,45 +359,46 @@ mod tests {
     use sim_core::domain::SimDomainDescriptor;
 
     #[test]
-    fn test_wgpu_simulator_step_and_conservation() {
-        pollster::block_on(async {
-            let mut desc = SimDomainDescriptor::default();
-            desc.grid_res_x = 32;
-            desc.grid_res_y = 32;
-            desc.extent_x = 32.0;
-            desc.extent_y = 32.0;
+    fn test_wgpu_simulator_backend_trait() {
+        let mut desc = SimDomainDescriptor::default();
+        desc.grid_res_x = 32;
+        desc.grid_res_y = 32;
+        desc.extent_x = 32.0;
+        desc.extent_y = 32.0;
 
-            let mut grid = DoubleBufferedGrid::new(desc);
+        let mut grid = DoubleBufferedGrid::new(desc);
 
-            // Water block in the center
-            for y in 10..22 {
-                for x in 10..22 {
-                    let idx = grid.current.idx(x, y);
-                    grid.current.h[idx] = 3.0;
-                }
+        // Water block in the center
+        for y in 10..22 {
+            for x in 10..22 {
+                let idx = grid.current.idx(x, y);
+                grid.current.h[idx] = 3.0;
             }
+        }
 
-            let initial_mass = grid.current.interior_mass();
+        // Test through trait object
+        let mut sim: Box<dyn SimulationBackend> = Box::new(WgpuSimulator::new_sync(grid));
+        assert_eq!(sim.backend_name(), "GPU (wgpu/WGSL)");
 
-            let mut sim = WgpuSimulator::new(grid).await;
+        let initial_mass = sim.total_fluid_mass();
+        assert!(initial_mass > 0.0);
 
-            let dt = 0.005;
-            for _ in 0..50 {
-                sim.step(dt);
-            }
+        let dt = 0.005;
+        for _ in 0..50 {
+            sim.step(dt);
+        }
 
-            sim.sync_to_cpu().await;
+        sim.sync_to_cpu();
 
-            let final_mass = sim.cpu_grid.current.interior_mass();
-            let diff = (initial_mass - final_mass).abs();
+        let final_mass = sim.total_fluid_mass();
+        let diff = (initial_mass - final_mass).abs();
 
-            assert!(
-                diff < 1e-2,
-                "GPU simulation mass not conserved! Initial: {}, Final: {}, Diff: {}",
-                initial_mass,
-                final_mass,
-                diff
-            );
-        });
+        assert!(
+            diff < 1e-2,
+            "GPU simulation mass not conserved! Initial: {}, Final: {}, Diff: {}",
+            initial_mass,
+            final_mass,
+            diff
+        );
     }
 }

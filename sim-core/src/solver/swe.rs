@@ -74,9 +74,9 @@ pub fn step_swe_with_params(grid: &mut DoubleBufferedGrid, dt: f32, params: &Swe
     // Ensure ghost cells on the current buffer are up to date before computing interface fluxes
     grid.current.apply_reflective_boundaries();
 
-    // Helper for local wave speed
+    // Helper for local wave speed with protection against negative depths
     let wave_speed = |h: f32, v: f32| -> f32 {
-        v.abs() + (g * h).sqrt()
+        v.abs() + (g * h.max(0.0)).sqrt()
     };
 
     // Flux function for Shallow Water Equations:
@@ -208,8 +208,20 @@ pub fn step_swe_with_params(grid: &mut DoubleBufferedGrid, dt: f32, params: &Swe
                 u_next = 0.0;
                 v_next = 0.0;
             } else {
-                let raw_u = hu_next / h_next;
-                let raw_v = hv_next / h_next;
+                // Desingularized velocity recovery: u = h * (hu) / (h^2 + h_dry^2)
+                // Prevents artificial velocity singularities at thin wetting fronts
+                let denom = h_next * h_next + h_dry * h_dry;
+                let mut raw_u = (h_next * hu_next) / denom;
+                let mut raw_v = (h_next * hv_next) / denom;
+
+                // Physical velocity ceiling (Froude limiter) to prevent numerical blowup
+                let raw_speed = (raw_u * raw_u + raw_v * raw_v).sqrt();
+                let max_speed = 20.0f32;
+                if raw_speed > max_speed {
+                    let scale = max_speed / raw_speed;
+                    raw_u *= scale;
+                    raw_v *= scale;
+                }
 
                 // Semi-implicit Manning friction drag:
                 // S_f = g * n^2 * |v| * v / h^(4/3)
