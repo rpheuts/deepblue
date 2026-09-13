@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "sim-core",
+    "sim-backend",
+    "sim-client-2d"
+]
+resolver = "2"
