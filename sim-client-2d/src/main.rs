@@ -117,11 +117,12 @@ async fn main() {
             let r2 = radius * radius;
 
             let add_water = is_mouse_button_down(MouseButton::Left) && !is_key_down(KeyCode::LeftShift);
-            let build_dam = is_mouse_button_down(MouseButton::Middle)
-                || (is_key_down(KeyCode::LeftShift) && is_mouse_button_down(MouseButton::Left));
-            let dig_trench = is_mouse_button_down(MouseButton::Right);
+            let build_dam = (is_key_down(KeyCode::LeftShift) && is_mouse_button_down(MouseButton::Left))
+                || is_mouse_button_down(MouseButton::Middle);
+            let dig_trench = is_mouse_button_down(MouseButton::Right) && !is_key_down(KeyCode::LeftShift);
+            let dump_sand = is_key_down(KeyCode::LeftShift) && is_mouse_button_down(MouseButton::Right);
 
-            if add_water || build_dam || dig_trench {
+            if add_water || build_dam || dig_trench || dump_sand {
                 for dy in -radius..=radius {
                     for dx in -radius..=radius {
                         if dx * dx + dy * dy <= r2 {
@@ -133,9 +134,14 @@ async fn main() {
                                 sim.current_state_mut().h[idx] += 0.3;
                             } else if build_dam {
                                 sim.current_state_mut().z_bed[idx] += 0.12;
+                            } else if dump_sand {
+                                // Dump loose erodible sand
+                                sim.current_state_mut().z_bed[idx] += 0.08;
+                                sim.current_state_mut().soil_sat[idx] = 0.10;
                             } else if dig_trench {
                                 let cur_z = sim.current_state().z_bed[idx];
-                                sim.current_state_mut().z_bed[idx] = (cur_z - 0.12).max(0.0);
+                                let bedrock = sim.current_state().bedrock_z[idx];
+                                sim.current_state_mut().z_bed[idx] = (cur_z - 0.12).max(bedrock);
                             }
                         }
                     }
@@ -192,12 +198,13 @@ async fn main() {
 
         let state = sim.current_state();
 
-        // --- 6. Topographic Hillshade & Water Shader Blitting ---
+        // --- 6. Topographic Hillshade, Soil Moisture & Suspended Sediment Shading ---
         for y in 0..desc.grid_res_y {
             for x in 0..desc.grid_res_x {
                 let idx = state.idx(x, y);
                 let z = state.z_bed[idx];
                 let depth = state.h[idx];
+                let sat = state.soil_sat[idx].clamp(0.0, 1.0);
                 let byte_idx = idx * 4;
 
                 // 3D Directional hillshading: finite differences to estimate slope
@@ -222,9 +229,11 @@ async fn main() {
                     (160.0, 145.0, 130.0)
                 };
 
-                let r_land = (tr * shade).clamp(0.0, 255.0);
-                let g_land = (tg * shade).clamp(0.0, 255.0);
-                let b_land = (tb * shade).clamp(0.0, 255.0);
+                // Soil moisture / saturation effect: wet sand darkens naturally
+                let moisture_darkening = 1.0 - 0.32 * sat;
+                let r_land = (tr * shade * moisture_darkening).clamp(0.0, 255.0);
+                let g_land = (tg * shade * moisture_darkening).clamp(0.0, 255.0);
+                let b_land = (tb * shade * moisture_darkening).clamp(0.0, 255.0);
 
                 if depth > 0.005 {
                     // Water depth tint: shallow turquoise -> deep cobalt
@@ -236,6 +245,14 @@ async fn main() {
                         (15.0, 60.0, 165.0)
                     };
 
+                    // Suspended sediment tinting: muddy silty river brown where erosion occurs
+                    let c = state.sediment_c[idx].clamp(0.0, 0.5);
+                    let turbidity = (c / 0.10).clamp(0.0, 1.0);
+                    let (mud_r, mud_g, mud_b) = (175.0, 125.0, 70.0);
+                    let base_water_r = wr * (1.0 - turbidity) + mud_r * turbidity;
+                    let base_water_g = wg * (1.0 - turbidity) + mud_g * turbidity;
+                    let base_water_b = wb * (1.0 - turbidity) + mud_b * turbidity;
+
                     // Whitewater rapids foam based on fluid velocity
                     let u = state.u[idx];
                     let v = state.v[idx];
@@ -243,9 +260,9 @@ async fn main() {
                     let foam = (speed / 3.2).clamp(0.0, 1.0);
 
                     let water_alpha = (depth / 0.75).clamp(0.42, 0.92);
-                    let final_wr = wr * (1.0 - foam) + 245.0 * foam;
-                    let final_wg = wg * (1.0 - foam) + 250.0 * foam;
-                    let final_wb = wb * (1.0 - foam) + 255.0 * foam;
+                    let final_wr = base_water_r * (1.0 - foam) + 245.0 * foam;
+                    let final_wg = base_water_g * (1.0 - foam) + 250.0 * foam;
+                    let final_wb = base_water_b * (1.0 - foam) + 255.0 * foam;
 
                     img.bytes[byte_idx] = (r_land * (1.0 - water_alpha) + final_wr * water_alpha) as u8;
                     img.bytes[byte_idx + 1] = (g_land * (1.0 - water_alpha) + final_wg * water_alpha) as u8;
@@ -275,10 +292,12 @@ async fn main() {
 
         // --- 7. HUD Telemetry & Control Overlays ---
         let safe_dt = sim.compute_max_stable_dt(0.5);
-        let mass = sim.total_fluid_mass();
+        let fluid_mass = sim.total_fluid_mass();
+        let sed_mass = sim.total_sediment_mass();
+        let max_c = state.sediment_c.iter().copied().fold(0.0f32, f32::max);
 
         // Top bar
-        draw_rectangle(8.0, 8.0, 480.0, 108.0, Color::new(0.0, 0.0, 0.0, 0.75));
+        draw_rectangle(8.0, 8.0, 520.0, 118.0, Color::new(0.0, 0.0, 0.0, 0.78));
 
         draw_text(
             format!("FPS: {} | Backend: {}", get_fps(), sim.backend_name()),
@@ -289,7 +308,7 @@ async fn main() {
         );
 
         let preset_name = match current_preset {
-            ActivePreset::BeachStream => "Beach Stream (Flowing)",
+            ActivePreset::BeachStream => "Beach Stream (Flowing & Carving)",
             ActivePreset::DamBreak => "Dam Break",
             ActivePreset::LakeAtRest => "Lake at Rest",
         };
@@ -302,35 +321,45 @@ async fn main() {
                 if is_paused { "PAUSED" } else { "RUNNING" }
             ),
             16.0,
-            50.0,
+            48.0,
             16.0,
             YELLOW,
         );
 
         draw_text(
-            "Tools: [LMB] Add Water | [RMB] Dig Trench | [Shift+LMB] Build Dam",
+            "Tools: [LMB] Water | [RMB] Dig | [Shift+LMB] Dam | [Shift+RMB] Sand",
             16.0,
-            72.0,
+            68.0,
             15.0,
             GREEN,
         );
 
         draw_text(
+            "Keys: [1..3] Presets | [R] Reset | [I] Inflow | [P] Pause | [Space] Swap",
+            16.0,
+            86.0,
+            14.0,
+            LIGHTGRAY,
+        );
+
+        draw_text(
             format!(
-                "Keys: [1..3] Presets | [R] Reset | [I] Inflow | [P] Pause | Mass: {:.0} m³",
-                mass
+                "Fluid: {:.0} m³ | Solid Sed: {:.0} m³ | Max C: {:.1}%",
+                fluid_mass,
+                sed_mass,
+                max_c * 100.0
             ),
             16.0,
-            92.0,
-            15.0,
-            LIGHTGRAY,
+            104.0,
+            14.0,
+            SKYBLUE,
         );
 
         draw_text(
             format!("CFL Max dt: {:.4}s | Sub-step dt: {:.4}s", safe_dt, current_sub_dt),
             16.0,
-            110.0,
-            14.0,
+            120.0,
+            13.0,
             DARKGRAY,
         );
 

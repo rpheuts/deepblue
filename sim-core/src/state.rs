@@ -1,17 +1,23 @@
 use crate::domain::SimDomainDescriptor;
 
-/// A simple 2D Grid holding state for the simulation.
-/// Uses a flat vector for data to be GPU friendly in the future.
+/// A 2D Grid holding state for the hydraulic and sediment simulation.
+/// Uses flat vectors for physical fields to ensure efficient cache locality
+/// and direct compatibility with GPU compute storage buffers.
 #[derive(Clone, Debug)]
 pub struct GridState {
     pub width: u32,
     pub height: u32,
-    
-    // Physical state fields
-    pub z_bed: Vec<f32>,     // Elevation map
-    pub h: Vec<f32>,         // Water depth
-    pub u: Vec<f32>,         // Velocity X (or discharge uh)
-    pub v: Vec<f32>,         // Velocity Y (or discharge vh)
+
+    // Hydrodynamic state fields (Phase 1 & 2)
+    pub z_bed: Vec<f32>,     // Bed elevation (meters)
+    pub h: Vec<f32>,         // Water depth (meters)
+    pub u: Vec<f32>,         // Velocity X (m/s)
+    pub v: Vec<f32>,         // Velocity Y (m/s)
+
+    // Sediment & Geotechnical state fields (Phase 3)
+    pub sediment_c: Vec<f32>, // Volumetric suspended sediment concentration C in [0.0, 1.0]
+    pub soil_sat: Vec<f32>,   // Soil moisture / saturation W_sat in [0.0, 1.0]
+    pub bedrock_z: Vec<f32>,  // Non-erodible bedrock floor elevation (meters)
 }
 
 impl GridState {
@@ -24,6 +30,9 @@ impl GridState {
             h: vec![0.0; size],
             u: vec![0.0; size],
             v: vec![0.0; size],
+            sediment_c: vec![0.0; size],
+            soil_sat: vec![0.0; size],
+            bedrock_z: vec![0.0; size],
         }
     }
 
@@ -34,13 +43,28 @@ impl GridState {
 
     /// Calculates the total fluid volume in the interior simulation domain (excluding ghost halo cells).
     pub fn interior_mass(&self) -> f32 {
-        let mut mass = 0.0;
+        let mut mass = 0.0f64;
         for y in 1..(self.height - 1) {
             for x in 1..(self.width - 1) {
-                mass += self.h[self.idx(x, y)];
+                mass += self.h[self.idx(x, y)] as f64;
             }
         }
-        mass
+        mass as f32
+    }
+
+    /// Calculates the total solid sediment volume in the interior simulation domain:
+    ///
+    /// Total Solid Volume = sum(z_bed) + sum(C * h / (1 - p))
+    pub fn interior_sediment_mass(&self, porosity: f32) -> f32 {
+        let factor = 1.0f64 / (1.0 - porosity.clamp(0.01, 0.99) as f64);
+        let mut total = 0.0f64;
+        for y in 1..(self.height - 1) {
+            for x in 1..(self.width - 1) {
+                let idx = self.idx(x, y);
+                total += (self.z_bed[idx] as f64) + ((self.sediment_c[idx] as f64) * (self.h[idx] as f64) * factor);
+            }
+        }
+        total as f32
     }
 
     /// Applies reflective wall boundary conditions to the 1-cell ghost halo ring.
@@ -64,6 +88,9 @@ impl GridState {
             self.z_bed[idx_t0] = self.z_bed[idx_t1];
             self.u[idx_t0] = self.u[idx_t1];
             self.v[idx_t0] = -self.v[idx_t1]; // Invert normal velocity
+            self.sediment_c[idx_t0] = self.sediment_c[idx_t1];
+            self.soil_sat[idx_t0] = self.soil_sat[idx_t1];
+            self.bedrock_z[idx_t0] = self.bedrock_z[idx_t1];
 
             let idx_b0 = self.idx(x, height - 1);
             let idx_b1 = self.idx(x, height - 2);
@@ -71,6 +98,9 @@ impl GridState {
             self.z_bed[idx_b0] = self.z_bed[idx_b1];
             self.u[idx_b0] = self.u[idx_b1];
             self.v[idx_b0] = -self.v[idx_b1]; // Invert normal velocity
+            self.sediment_c[idx_b0] = self.sediment_c[idx_b1];
+            self.soil_sat[idx_b0] = self.soil_sat[idx_b1];
+            self.bedrock_z[idx_b0] = self.bedrock_z[idx_b1];
         }
 
         // 2. Left and Right ghost columns (excluding corners)
@@ -81,6 +111,9 @@ impl GridState {
             self.z_bed[idx_l0] = self.z_bed[idx_l1];
             self.u[idx_l0] = -self.u[idx_l1]; // Invert normal velocity
             self.v[idx_l0] = self.v[idx_l1];
+            self.sediment_c[idx_l0] = self.sediment_c[idx_l1];
+            self.soil_sat[idx_l0] = self.soil_sat[idx_l1];
+            self.bedrock_z[idx_l0] = self.bedrock_z[idx_l1];
 
             let idx_r0 = self.idx(width - 1, y);
             let idx_r1 = self.idx(width - 2, y);
@@ -88,6 +121,9 @@ impl GridState {
             self.z_bed[idx_r0] = self.z_bed[idx_r1];
             self.u[idx_r0] = -self.u[idx_r1]; // Invert normal velocity
             self.v[idx_r0] = self.v[idx_r1];
+            self.sediment_c[idx_r0] = self.sediment_c[idx_r1];
+            self.soil_sat[idx_r0] = self.soil_sat[idx_r1];
+            self.bedrock_z[idx_r0] = self.bedrock_z[idx_r1];
         }
 
         // 3. Four corners: diagonal reflection
@@ -104,6 +140,9 @@ impl GridState {
             self.z_bed[g_idx] = self.z_bed[i_idx];
             self.u[g_idx] = -self.u[i_idx];
             self.v[g_idx] = -self.v[i_idx];
+            self.sediment_c[g_idx] = self.sediment_c[i_idx];
+            self.soil_sat[g_idx] = self.soil_sat[i_idx];
+            self.bedrock_z[g_idx] = self.bedrock_z[i_idx];
         }
     }
 }

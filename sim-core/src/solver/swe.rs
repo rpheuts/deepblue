@@ -114,6 +114,9 @@ pub fn step_swe_with_params(grid: &mut DoubleBufferedGrid, dt: f32, params: &Swe
                 grid.next.u[idx] = 0.0;
                 grid.next.v[idx] = 0.0;
                 grid.next.z_bed[idx] = z_c;
+                grid.next.sediment_c[idx] = grid.current.sediment_c[idx];
+                grid.next.soil_sat[idx] = grid.current.soil_sat[idx];
+                grid.next.bedrock_z[idx] = grid.current.bedrock_z[idx];
                 continue;
             }
 
@@ -193,6 +196,22 @@ pub fn step_swe_with_params(grid: &mut DoubleBufferedGrid, dt: f32, params: &Swe
             let dhu_dt = -((flux_x_right_hu - flux_x_left_hu) / dx + (flux_y_bottom_hu - flux_y_top_hu) / dy) + source_hu;
             let dhv_dt = -((flux_x_right_hv - flux_x_left_hv) / dx + (flux_y_bottom_hv - flux_y_top_hv) / dy) + source_hv;
 
+            // Conservative Suspended Sediment Advection (Flux Consistent with SWE)
+            let c_c = grid.current.sediment_c[idx];
+            let c_l = grid.current.sediment_c[idx_l];
+            let c_r = grid.current.sediment_c[idx_r];
+            let c_t = grid.current.sediment_c[idx_t];
+            let c_b = grid.current.sediment_c[idx_b];
+
+            let flux_x_left_s = if flux_x_left_h > 0.0 { flux_x_left_h * c_l } else { flux_x_left_h * c_c };
+            let flux_x_right_s = if flux_x_right_h > 0.0 { flux_x_right_h * c_c } else { flux_x_right_h * c_r };
+            let flux_y_top_s = if flux_y_top_h > 0.0 { flux_y_top_h * c_t } else { flux_y_top_h * c_c };
+            let flux_y_bottom_s = if flux_y_bottom_h > 0.0 { flux_y_bottom_h * c_c } else { flux_y_bottom_h * c_b };
+
+            let dqs_dt = -((flux_x_right_s - flux_x_left_s) / dx + (flux_y_bottom_s - flux_y_top_s) / dy);
+            let qs_c = h_c * c_c;
+            let qs_next = (qs_c + dqs_dt * dt).max(0.0);
+
             let mut h_next = h_c + dh_dt * dt;
             let hu_next = (h_c * u_c) + dhu_dt * dt;
             let hv_next = (h_c * v_c) + dhv_dt * dt;
@@ -200,6 +219,8 @@ pub fn step_swe_with_params(grid: &mut DoubleBufferedGrid, dt: f32, params: &Swe
             // Positivity-preserving depth update and velocity recovery
             let u_next;
             let v_next;
+            let mut z_next = z_c;
+            let c_next;
 
             if h_next <= h_dry {
                 // Keep the small water depth (clamping only negligible numerical undershoot)
@@ -207,7 +228,13 @@ pub fn step_swe_with_params(grid: &mut DoubleBufferedGrid, dt: f32, params: &Swe
                 h_next = h_next.max(0.0);
                 u_next = 0.0;
                 v_next = 0.0;
+                // If cell dries out, any remaining suspended sediment settles to bed (porosity p = 0.40)
+                let inv_one_minus_p = 1.0 / (1.0 - 0.40);
+                z_next += qs_next * inv_one_minus_p;
+                c_next = 0.0;
             } else {
+                c_next = (qs_next / h_next).clamp(0.0, 0.50);
+
                 // Desingularized velocity recovery: u = h * (hu) / (h^2 + h_dry^2)
                 // Prevents artificial velocity singularities at thin wetting fronts
                 let denom = h_next * h_next + h_dry * h_dry;
@@ -241,7 +268,10 @@ pub fn step_swe_with_params(grid: &mut DoubleBufferedGrid, dt: f32, params: &Swe
             grid.next.h[idx] = h_next;
             grid.next.u[idx] = u_next;
             grid.next.v[idx] = v_next;
-            grid.next.z_bed[idx] = z_c;
+            grid.next.z_bed[idx] = z_next;
+            grid.next.sediment_c[idx] = c_next;
+            grid.next.soil_sat[idx] = grid.current.soil_sat[idx];
+            grid.next.bedrock_z[idx] = grid.current.bedrock_z[idx];
         }
     }
 

@@ -15,9 +15,11 @@ mod tests {
 
     #[test]
     fn test_lake_at_rest() {
-        let mut desc = SimDomainDescriptor::default();
-        desc.grid_res_x = 16;
-        desc.grid_res_y = 16;
+        let desc = SimDomainDescriptor {
+            grid_res_x: 16,
+            grid_res_y: 16,
+            ..Default::default()
+        };
         
         let mut grid = DoubleBufferedGrid::new(desc);
         
@@ -50,11 +52,13 @@ mod tests {
 
     #[test]
     fn test_mass_conservation_strict_sloshing() {
-        let mut desc = SimDomainDescriptor::default();
-        desc.grid_res_x = 24;
-        desc.grid_res_y = 24;
-        desc.extent_x = 24.0;
-        desc.extent_y = 24.0;
+        let desc = SimDomainDescriptor {
+            grid_res_x: 24,
+            grid_res_y: 24,
+            extent_x: 24.0,
+            extent_y: 24.0,
+            ..Default::default()
+        };
         
         let mut grid = DoubleBufferedGrid::new(desc);
         
@@ -91,11 +95,13 @@ mod tests {
 
     #[test]
     fn test_dam_break_ritter_benchmark() {
-        let mut desc = SimDomainDescriptor::default();
-        desc.grid_res_x = 100;
-        desc.grid_res_y = 8;
-        desc.extent_x = 100.0; // 1 meter per cell
-        desc.extent_y = 8.0;
+        let desc = SimDomainDescriptor {
+            grid_res_x: 100,
+            grid_res_y: 8,
+            extent_x: 100.0, // 1 meter per cell
+            extent_y: 8.0,
+            ..Default::default()
+        };
         
         let mut grid = DoubleBufferedGrid::new(desc);
         let h0 = 4.0f32;
@@ -162,9 +168,11 @@ mod tests {
     fn test_cpu_simulator_backend_trait() {
         use crate::backend::{CpuSimulator, SimulationBackend};
 
-        let mut desc = SimDomainDescriptor::default();
-        desc.grid_res_x = 20;
-        desc.grid_res_y = 20;
+        let desc = SimDomainDescriptor {
+            grid_res_x: 20,
+            grid_res_y: 20,
+            ..Default::default()
+        };
         let mut grid = DoubleBufferedGrid::new(desc);
 
         for y in 5..15 {
@@ -188,6 +196,256 @@ mod tests {
         let final_mass = sim.total_fluid_mass();
         let diff = (initial_mass - final_mass).abs();
         assert!(diff < 1e-3, "Mass not conserved through trait object! Diff: {}", diff);
+    }
+
+    #[test]
+    fn test_sediment_mass_conservation() {
+        use crate::solver::sediment::{step_sediment, SedimentParams};
+        use crate::solver::swe::{step_swe_with_params, SweParams};
+
+        let desc = SimDomainDescriptor {
+            grid_res_x: 32,
+            grid_res_y: 32,
+            extent_x: 32.0,
+            extent_y: 32.0,
+            ..Default::default()
+        };
+        let mut grid = DoubleBufferedGrid::new(desc);
+
+        let p = 0.40;
+        let sed_params = SedimentParams {
+            porosity: p,
+            erodibility: 0.05,
+            capacity_scale: 0.10,
+            ..Default::default()
+        };
+
+        // Sand bed of 1.5m over bedrock at 0.0m
+        for i in 0..grid.current.z_bed.len() {
+            grid.current.z_bed[i] = 1.5;
+            grid.current.bedrock_z[i] = 0.0;
+        }
+
+        // Fast water stream in the middle to trigger strong erosion and suspended transport
+        for y in 10..22 {
+            for x in 10..22 {
+                let idx = grid.current.idx(x, y);
+                grid.current.h[idx] = 1.0;
+                grid.current.u[idx] = 1.5; // High velocity well above critical velocity (0.22 m/s)
+            }
+        }
+
+        grid.apply_reflective_boundaries();
+
+        let initial_sediment_mass = grid.current.interior_sediment_mass(p);
+        let initial_fluid_mass = grid.current.interior_mass();
+
+        let swe_params = SweParams::default();
+        let dt = 0.02;
+
+        // Run 50 coupled hydrodynamic + sediment steps
+        for _ in 0..50 {
+            step_swe_with_params(&mut grid, dt, &swe_params);
+            step_sediment(&mut grid, dt, &sed_params);
+        }
+
+        let final_sediment_mass = grid.current.interior_sediment_mass(p);
+        let final_fluid_mass = grid.current.interior_mass();
+
+        // 1. Water mass must remain strictly conserved
+        let fluid_diff = (initial_fluid_mass - final_fluid_mass).abs();
+        assert!(
+            fluid_diff < 1e-3,
+            "Fluid mass diverged during coupled simulation! Initial: {}, Final: {}, Diff: {}",
+            initial_fluid_mass,
+            final_fluid_mass,
+            fluid_diff
+        );
+
+        // 2. Sediment total solid mass must remain strictly conserved
+        let sed_diff = (initial_sediment_mass - final_sediment_mass).abs();
+        let rel_error = sed_diff / initial_sediment_mass;
+        assert!(
+            rel_error < 1e-4,
+            "Sediment mass not conserved! Initial: {}, Final: {}, Diff: {}, Rel Error: {}",
+            initial_sediment_mass,
+            final_sediment_mass,
+            sed_diff,
+            rel_error
+        );
+
+        // 3. Confirm that erosion actually occurred (bed was sculpted, suspended sediment generated)
+        let max_c = grid.current.sediment_c.iter().copied().fold(0.0f32, f32::max);
+        let min_z = grid.current.z_bed.iter().copied().fold(f32::INFINITY, f32::min);
+        assert!(max_c > 0.001, "Erosion failed to suspend sediment into water column! Max C: {}", max_c);
+        assert!(min_z < 1.49, "Bed was not eroded by high speed water! Min Z: {}", min_z);
+    }
+
+    #[test]
+    fn test_bedrock_erosion_limit() {
+        use crate::solver::sediment::{step_sediment, SedimentParams};
+        use crate::solver::swe::{step_swe_with_params, SweParams};
+
+        let desc = SimDomainDescriptor {
+            grid_res_x: 24,
+            grid_res_y: 24,
+            ..Default::default()
+        };
+        let mut grid = DoubleBufferedGrid::new(desc);
+
+        let bedrock_level = 0.50f32;
+        for i in 0..grid.current.z_bed.len() {
+            grid.current.z_bed[i] = bedrock_level; // Bed begins exactly on bedrock
+            grid.current.bedrock_z[i] = bedrock_level;
+        }
+
+        // Violent flow directly on top of bedrock
+        for y in 4..20 {
+            for x in 4..20 {
+                let idx = grid.current.idx(x, y);
+                grid.current.h[idx] = 2.0;
+                grid.current.u[idx] = 3.0;
+            }
+        }
+
+        grid.apply_reflective_boundaries();
+
+        let sed_params = SedimentParams {
+            erodibility: 0.1, // Extremely aggressive erosion rate
+            ..Default::default()
+        };
+
+        let swe_params = SweParams::default();
+        for _ in 0..30 {
+            step_swe_with_params(&mut grid, 0.02, &swe_params);
+            step_sediment(&mut grid, 0.02, &sed_params);
+        }
+
+        // Bed elevation must never drop below bedrock level
+        for (i, &z) in grid.current.z_bed.iter().enumerate() {
+            let b = grid.current.bedrock_z[i];
+            assert!(
+                z >= b - 1e-6,
+                "Erosion breached bedrock floor! Bed Z: {}, Bedrock: {}",
+                z,
+                b
+            );
+        }
+    }
+
+    #[test]
+    fn test_talus_collapse_conservation_and_repose() {
+        use crate::solver::sediment::{step_talus_collapse, SedimentParams};
+
+        let desc = SimDomainDescriptor {
+            grid_res_x: 25,
+            grid_res_y: 25,
+            extent_x: 25.0, // dx = 1.0m
+            extent_y: 25.0, // dy = 1.0m
+            ..Default::default()
+        };
+        let mut grid = DoubleBufferedGrid::new(desc);
+
+        let params = SedimentParams::default(); // phi_dry = 34 degrees
+
+        // Create a steep square sand tower in the center
+        let mid_x = 12;
+        let mid_y = 12;
+        for y in 1..(desc.grid_res_y - 1) {
+            for x in 1..(desc.grid_res_x - 1) {
+                let idx = grid.current.idx(x, y);
+                grid.current.z_bed[idx] = 0.0;
+                grid.current.bedrock_z[idx] = 0.0;
+                grid.current.soil_sat[idx] = 0.0; // Dry sand
+            }
+        }
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let idx = grid.current.idx((mid_x + dx) as u32, (mid_y + dy) as u32);
+                grid.current.z_bed[idx] = 5.0; // 5m vertical cliff!
+            }
+        }
+
+        grid.apply_reflective_boundaries();
+
+        let initial_bed_mass = grid.current.interior_sediment_mass(0.40);
+
+        // Relax the steep tower over multiple talus passes
+        for _ in 0..25 {
+            step_talus_collapse(&mut grid, &params);
+        }
+
+        let final_bed_mass = grid.current.interior_sediment_mass(0.40);
+        let mass_diff = (initial_bed_mass - final_bed_mass).abs();
+
+        // 1. Exact mass conservation during talus collapse
+        assert!(
+            mass_diff < 1e-4,
+            "Talus collapse did not conserve sediment mass! Diff: {}",
+            mass_diff
+        );
+
+        // 2. Sand must have spread outwards from the tower to its surrounding base
+        let base_idx = grid.current.idx(mid_x as u32 + 3, mid_y as u32);
+        assert!(
+            grid.current.z_bed[base_idx] > 0.05,
+            "Talus did not spread to base! z = {}",
+            grid.current.z_bed[base_idx]
+        );
+
+        // 3. Peak of tower must have lowered
+        let center_idx = grid.current.idx(mid_x as u32, mid_y as u32);
+        assert!(
+            grid.current.z_bed[center_idx] < 5.0,
+            "Peak did not collapse! Peak z = {}",
+            grid.current.z_bed[center_idx]
+        );
+    }
+
+    #[test]
+    fn test_talus_saturation_dependency() {
+        use crate::solver::sediment::{step_talus_collapse, SedimentParams};
+
+        let desc = SimDomainDescriptor {
+            grid_res_x: 40,
+            grid_res_y: 20,
+            extent_x: 40.0,
+            extent_y: 20.0,
+            ..Default::default()
+        };
+        let mut grid = DoubleBufferedGrid::new(desc);
+        let params = SedimentParams::default();
+
+        // Tower 1 on left (mid_x = 10): Damp sand (W_sat = 0.25, high capillary cohesion, phi = 45 deg)
+        // Tower 2 on right (mid_x = 30): Saturated sand (W_sat = 1.00, liquefaction slump, phi = 22 deg)
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                let idx_damp = grid.current.idx((10 + dx) as u32, (10 + dy) as u32);
+                grid.current.z_bed[idx_damp] = 4.0;
+                grid.current.soil_sat[idx_damp] = 0.25;
+
+                let idx_sat = grid.current.idx((30 + dx) as u32, (10 + dy) as u32);
+                grid.current.z_bed[idx_sat] = 4.0;
+                grid.current.soil_sat[idx_sat] = 1.00;
+            }
+        }
+
+        grid.apply_reflective_boundaries();
+
+        for _ in 0..20 {
+            step_talus_collapse(&mut grid, &params);
+        }
+
+        let damp_peak = grid.current.z_bed[grid.current.idx(10, 10)];
+        let sat_peak = grid.current.z_bed[grid.current.idx(30, 10)];
+
+        // Damp sand must preserve a higher, steeper peak due to capillary cohesion (phi_damp > phi_sat)
+        assert!(
+            damp_peak > sat_peak + 0.20,
+            "Damp sand did not maintain steeper profile than liquefied saturated sand! Damp: {}, Sat: {}",
+            damp_peak,
+            sat_peak
+        );
     }
 }
 

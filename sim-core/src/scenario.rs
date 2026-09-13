@@ -71,12 +71,22 @@ impl Scenarios {
                 grid.current.z_bed[idx] = z;
                 grid.next.z_bed[idx] = z;
 
+                // Non-erodible bedrock floor below erodible alluvium
+                let bedrock = (z - 0.50).max(0.0);
+                grid.current.bedrock_z[idx] = bedrock;
+                grid.next.bedrock_z[idx] = bedrock;
+
                 // Pre-fill upstream reservoir behind the dam with water up to spillway level
                 if ny < 0.19 && dist < (channel_width * 2.5) {
                     let water_level = 2.45;
                     if water_level > z {
                         grid.current.h[idx] = water_level - z;
                     }
+                }
+
+                if grid.current.h[idx] > 1e-4 {
+                    grid.current.soil_sat[idx] = 1.0;
+                    grid.next.soil_sat[idx] = 1.0;
                 }
             }
         }
@@ -111,6 +121,14 @@ impl Scenarios {
                     grid.current.z_bed[idx] = 6.0;
                     grid.next.z_bed[idx] = 6.0;
                 }
+
+                grid.current.bedrock_z[idx] = (grid.current.z_bed[idx] - 0.40).max(0.0);
+                grid.next.bedrock_z[idx] = grid.current.bedrock_z[idx];
+
+                if grid.current.h[idx] > 1e-4 {
+                    grid.current.soil_sat[idx] = 1.0;
+                    grid.next.soil_sat[idx] = 1.0;
+                }
             }
         }
 
@@ -129,7 +147,11 @@ impl Scenarios {
                 let z = 1.0 + (x as f32 * 0.1).sin() * 0.5 + (y as f32 * 0.1).cos() * 0.5;
                 grid.current.z_bed[idx] = z;
                 grid.next.z_bed[idx] = z;
+                grid.current.bedrock_z[idx] = 0.0;
+                grid.next.bedrock_z[idx] = 0.0;
                 grid.current.h[idx] = (target_eta - z).max(0.0);
+                grid.current.soil_sat[idx] = 1.0;
+                grid.next.soil_sat[idx] = 1.0;
             }
         }
 

@@ -53,6 +53,11 @@ pub trait SimulationBackend {
         self.current_state().interior_mass()
     }
 
+    /// Calculates the total solid sediment mass (bed + suspended) in the active physical domain.
+    fn total_sediment_mass(&self) -> f32 {
+        self.current_state().interior_sediment_mass(0.40)
+    }
+
     /// Evaluates the Courant-Friedrichs-Lewy (CFL) condition across the active domain
     /// and returns the maximum allowable stable time step.
     fn compute_max_stable_dt(&self, cfl: f32) -> f32;
@@ -64,25 +69,46 @@ pub trait SimulationBackend {
 /// and low-spec/no-GPU fallback environments.
 pub struct CpuSimulator {
     pub grid: DoubleBufferedGrid,
-    pub params: SweParams,
+    pub swe_params: SweParams,
+    pub sediment_params: crate::solver::sediment::SedimentParams,
+    pub enable_sediment: bool,
 }
 
 impl CpuSimulator {
-    /// Creates a new CPU simulator with default SWE physical parameters.
+    /// Creates a new CPU simulator with default physical parameters.
     pub fn new(mut grid: DoubleBufferedGrid) -> Self {
         grid.apply_reflective_boundaries();
         Self {
             grid,
-            params: SweParams::default(),
+            swe_params: SweParams::default(),
+            sediment_params: crate::solver::sediment::SedimentParams::default(),
+            enable_sediment: true,
         }
     }
 
     /// Creates a new CPU simulator with custom SWE physical parameters.
-    pub fn with_params(mut grid: DoubleBufferedGrid, params: SweParams) -> Self {
+    pub fn with_params(mut grid: DoubleBufferedGrid, swe_params: SweParams) -> Self {
         grid.apply_reflective_boundaries();
         Self {
             grid,
-            params,
+            swe_params,
+            sediment_params: crate::solver::sediment::SedimentParams::default(),
+            enable_sediment: true,
+        }
+    }
+
+    /// Creates a new CPU simulator with custom SWE and sediment physical parameters.
+    pub fn with_sediment_params(
+        mut grid: DoubleBufferedGrid,
+        swe_params: SweParams,
+        sediment_params: crate::solver::sediment::SedimentParams,
+    ) -> Self {
+        grid.apply_reflective_boundaries();
+        Self {
+            grid,
+            swe_params,
+            sediment_params,
+            enable_sediment: true,
         }
     }
 }
@@ -97,7 +123,10 @@ impl SimulationBackend for CpuSimulator {
     }
 
     fn step(&mut self, dt: f32) {
-        step_swe_with_params(&mut self.grid, dt, &self.params);
+        step_swe_with_params(&mut self.grid, dt, &self.swe_params);
+        if self.enable_sediment {
+            crate::solver::sediment::step_sediment(&mut self.grid, dt, &self.sediment_params);
+        }
     }
 
     fn sync_to_cpu(&mut self) {
@@ -123,6 +152,6 @@ impl SimulationBackend for CpuSimulator {
     fn compute_max_stable_dt(&self, cfl: f32) -> f32 {
         let dx = self.grid.descriptor.extent_x / self.grid.descriptor.grid_res_x as f32;
         let dy = self.grid.descriptor.extent_y / self.grid.descriptor.grid_res_y as f32;
-        compute_max_stable_dt(&self.grid.current, dx, dy, cfl, self.params.gravity)
+        compute_max_stable_dt(&self.grid.current, dx, dy, cfl, self.swe_params.gravity)
     }
 }

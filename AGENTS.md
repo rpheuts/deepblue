@@ -166,10 +166,10 @@ Support adaptive sub-stepping to prevent solver explosions when flow velocities 
 * [x] Implement standard texture binding contract (`ElevationMap`, `WaterMap`, `VelocityMap`).
 
 
-* [ ] **Phase 3: Sediment Transport & Dynamic Bed Mechanics**
-* Implement Exner mass conservation and capacity formulations.
-* Add multi-neighbor talus/angle-of-repose relaxation pass.
-* Saturation tracking ($W_{sat}$) for soil stability and roughness shading.
+* [x] **Phase 3: Sediment Transport & Dynamic Bed Mechanics**
+* [x] Implement Exner mass conservation and capacity formulations.
+* [x] Add multi-neighbor talus/angle-of-repose relaxation pass.
+* [x] Saturation tracking ($W_{sat}$) for soil stability and roughness shading.
 
 
 * [ ] **Phase 4: Tooling, Boundary Conditions & Interaction**
