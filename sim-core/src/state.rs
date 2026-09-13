@@ -67,6 +67,23 @@ impl GridState {
         total as f32
     }
 
+    /// Calculates the total water volume in the interior domain including both surface water and soil pore water:
+    ///
+    /// Total Water Volume = sum(h) + sum(soil_sat * min(z_bed - bedrock_z, 0.20) * porosity)
+    pub fn interior_total_water_mass(&self, porosity: f32) -> f32 {
+        let mut total = 0.0f64;
+        let p = porosity.clamp(0.01, 0.99) as f64;
+        for y in 1..(self.height - 1) {
+            for x in 1..(self.width - 1) {
+                let idx = self.idx(x, y);
+                let soil_depth = (self.z_bed[idx] - self.bedrock_z[idx]).clamp(0.0, 0.20) as f64;
+                let pore_water = (self.soil_sat[idx] as f64) * soil_depth * p;
+                total += (self.h[idx] as f64) + pore_water;
+            }
+        }
+        total as f32
+    }
+
     /// Applies reflective wall boundary conditions to the 1-cell ghost halo ring.
     pub fn apply_reflective_boundaries(&mut self) {
         crate::boundary::apply_domain_boundaries(self, &crate::boundary::DomainBoundaryConfig::default(), 0.0);

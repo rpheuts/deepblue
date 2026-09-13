@@ -16,10 +16,12 @@ struct StepParams {
 @group(0) @binding(0) var<uniform> domain: SimDomain;
 @group(0) @binding(1) var<uniform> params: StepParams;
 
-// 3 storage buffers: 2 read + 1 write
-@group(0) @binding(2) var<storage, read> in_h: array<f32>;
+// 5 storage buffers: 3 read + 2 write
+@group(0) @binding(2) var<storage, read_write> io_h: array<f32>;
 @group(0) @binding(3) var<storage, read> in_sat: array<f32>;
 @group(0) @binding(4) var<storage, read_write> out_sat: array<f32>;
+@group(0) @binding(5) var<storage, read> in_z: array<f32>;
+@group(0) @binding(6) var<storage, read> in_bedrock: array<f32>;
 
 fn get_idx(x: u32, y: u32) -> u32 {
     return y * domain.grid_res_x + x;
@@ -38,12 +40,31 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
 
     let idx = get_idx(x, y);
-    let h = in_h[idx];
+    let h = io_h[idx];
+    let sat_c = in_sat[idx];
+    let z = in_z[idx];
+    let bedrock = in_bedrock[idx];
+
+    let soil_depth = clamp(z - bedrock, 0.0, 0.20);
+    let porosity = 0.40;
+    let h_capacity = soil_depth * porosity;
+    let k_sat = 0.015;
 
     if (h > 1e-4) {
-        out_sat[idx] = 1.0;
+        var absorbed = 0.0;
+        var next_sat = 1.0;
+
+        if (h_capacity > 0.005 && sat_c < 0.999) {
+            let room = (1.0 - sat_c) * h_capacity;
+            let suction_mult = 1.0 + 2.0 * (1.0 - sat_c);
+            let potential_flux = min(h, k_sat * suction_mult * dt);
+            absorbed = min(potential_flux, room);
+            next_sat = clamp(sat_c + absorbed / h_capacity, 0.0, 1.0);
+        }
+
+        io_h[idx] = max(0.0, h - absorbed);
+        out_sat[idx] = next_sat;
     } else {
-        let sat_c = in_sat[idx];
         let sat_l = in_sat[get_idx(x - 1u, y)];
         let sat_r = in_sat[get_idx(x + 1u, y)];
         let sat_t = in_sat[get_idx(x, y - 1u)];
@@ -51,7 +72,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
         let laplacian = sat_l + sat_r + sat_t + sat_b - 4.0 * sat_c;
         let diffusion_rate = 0.05;
-        let drying_rate = 0.02;
+        let drying_rate = 0.015;
         let next_sat = sat_c + (diffusion_rate * laplacian - drying_rate * sat_c) * dt;
         out_sat[idx] = clamp(next_sat, 0.0, 1.0);
     }

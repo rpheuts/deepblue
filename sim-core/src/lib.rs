@@ -177,6 +177,11 @@ mod tests {
         };
         let mut grid = DoubleBufferedGrid::new(desc);
 
+        // Bedrock surface: impervious rock so zero porous infiltration occurs
+        for i in 0..grid.current.z_bed.len() {
+            grid.current.bedrock_z[i] = grid.current.z_bed[i];
+        }
+
         for y in 5..15 {
             for x in 5..15 {
                 let idx = grid.current.idx(x, y);
@@ -219,6 +224,7 @@ mod tests {
             porosity: p,
             erodibility: 0.05,
             capacity_scale: 0.10,
+            infiltration_rate: 0.0, // Infiltration isolated to test pure Exner dynamics
             ..Default::default()
         };
 
@@ -558,6 +564,102 @@ mod tests {
             let b = post_state.bedrock_z[i];
             assert!(z >= b - 1e-4, "Bed elevation below bedrock at index {}: z={}, b={}", i, z, b);
         }
+    }
+
+    #[test]
+    fn test_porous_infiltration_mass_transfer() {
+        use crate::solver::sediment::{step_sediment, SedimentParams};
+
+        let desc = SimDomainDescriptor {
+            grid_res_x: 16,
+            grid_res_y: 16,
+            extent_x: 16.0,
+            extent_y: 16.0,
+            ..Default::default()
+        };
+        let mut grid = DoubleBufferedGrid::new(desc);
+
+        let p = 0.40;
+        let sed_params = SedimentParams {
+            porosity: p,
+            infiltration_rate: 0.02, // 20 mm/s
+            soil_diffusion_rate: 0.0,
+            soil_drying_rate: 0.0,
+            erodibility: 0.0,
+            talus_iterations: 0,
+            ..Default::default()
+        };
+
+        // Sand bed: 0.5m over bedrock at 0.0m (soil_depth = 0.20m, capacity = 0.08m)
+        // Initially completely dry (soil_sat = 0.0)
+        for i in 0..grid.current.z_bed.len() {
+            grid.current.z_bed[i] = 0.5;
+            grid.current.bedrock_z[i] = 0.0;
+            grid.current.soil_sat[i] = 0.0;
+        }
+
+        // Add a block of shallow water in the interior (4x4 cells)
+        for y in 6..10 {
+            for x in 6..10 {
+                let idx = grid.current.idx(x, y);
+                grid.current.h[idx] = 0.04; // 40 mm water
+            }
+        }
+
+        // Impervious stone cell at (4, 4) with bedrock == z_bed (0 soil depth)
+        let stone_idx = grid.current.idx(4, 4);
+        grid.current.z_bed[stone_idx] = 0.5;
+        grid.current.bedrock_z[stone_idx] = 0.5;
+        grid.current.h[stone_idx] = 0.04;
+
+        grid.apply_reflective_boundaries();
+
+        let initial_surface_water = grid.current.interior_mass();
+        let initial_total_water = grid.current.interior_total_water_mass(p);
+
+        assert!(initial_surface_water > 0.0);
+
+        // Advance 5 steps of infiltration
+        let dt = 0.05;
+        for _ in 0..5 {
+            step_sediment(&mut grid, dt, &sed_params);
+        }
+
+        let post_surface_water = grid.current.interior_mass();
+        let post_total_water = grid.current.interior_total_water_mass(p);
+
+        // 1. Surface water h must strictly decrease as water infiltrates porous sand
+        assert!(
+            post_surface_water < initial_surface_water,
+            "Porous infiltration did not drain surface water! Initial: {}, Post: {}",
+            initial_surface_water,
+            post_surface_water
+        );
+
+        // 2. Soil moisture W_sat must increase
+        let sample_idx = grid.current.idx(7, 7);
+        assert!(
+            grid.current.soil_sat[sample_idx] > 0.0,
+            "Soil saturation did not increase! Got: {}",
+            grid.current.soil_sat[sample_idx]
+        );
+
+        // 3. Strict total water mass conservation (surface h + pore moisture)
+        let total_diff = (initial_total_water - post_total_water).abs();
+        assert!(
+            total_diff < 1e-4,
+            "Total water mass (surface + pore) not conserved! Initial: {}, Post: {}, Diff: {}",
+            initial_total_water,
+            post_total_water,
+            total_diff
+        );
+
+        // 4. Stone cell with z_bed == bedrock_z must not absorb water
+        assert!(
+            (grid.current.h[stone_idx] - 0.04).abs() < 1e-5,
+            "Impervious stone cell absorbed water! Depth: {}",
+            grid.current.h[stone_idx]
+        );
     }
 }
 

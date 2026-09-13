@@ -193,19 +193,33 @@ impl Scenarios {
                 let idx = grid.current.idx(x, y);
 
                 // --- 1. Base Coastline Bathymetry & Elevation ---
-                // North (ny < 0.38): Dunes & backshore (z = 0.95m to 2.2m)
-                // Middle (ny in 0.38..0.68): Steeper intertidal swash zone (z = 0.0m to 0.95m, increased pitch)
-                // South (ny > 0.68): Deep offshore seabed (z = -1.45m to 0.0m, >2.3x deeper ocean)
-                let mut z = if ny < 0.38 {
-                    let dune_progress = (0.38 - ny) / 0.38;
-                    0.95 + 1.25 * dune_progress.powf(1.2) + 0.08 * (nx * 6.0 * pi).sin() * (ny * 8.0 * pi).cos()
+                // Continuous C1 profile: Rolling Dunes -> Sloping Beach Swash Zone -> Deep Ocean Basin
+                // Ensures zero vertical shears, zero kinks, and zero horizontal seam artifacts.
+                let beach_slope = (0.95 - 0.10) / 0.33; // ~2.576 m/ny
+                let mut z = if ny < 0.35 {
+                    // Dunes & upper backshore (z = 0.95m at ny=0.35 to 2.20m at ny=0.0)
+                    let u = (0.35 - ny) / 0.35;
+                    let curvature = 2.20 - 0.95 - beach_slope * 0.35;
+                    let dune_base = 0.95 + beach_slope * (0.35 - ny) + curvature * u * u;
+                    let dune_bumps = 0.08 * u * u * (nx * 6.0 * pi).sin() * (ny * 4.0 * pi).cos();
+                    dune_base + dune_bumps
                 } else if ny < 0.68 {
-                    let beach_progress = (0.68 - ny) / 0.30;
-                    beach_progress * 0.95 + 0.03 * (nx * 12.0 * pi).sin()
+                    // Smooth, uniform sloping beach swash zone (z = 0.95m down to 0.10m)
+                    0.95 - beach_slope * (ny - 0.35)
                 } else {
-                    let deep_progress = (ny - 0.68) / 0.32;
-                    -1.45 * deep_progress.powf(0.85) + 0.03 * (nx * 8.0 * pi).cos()
+                    // Deep ocean basin (z = 0.10m at ny=0.68 smoothly descending to -1.45m at ny=1.0)
+                    let v = (ny - 0.68) / 0.32;
+                    let h00 = 1.0 - 3.0 * v * v + 2.0 * v * v * v;
+                    let h10 = v - 2.0 * v * v + v * v * v;
+                    let h01 = 3.0 * v * v - 2.0 * v * v * v;
+                    let shelf_base = 0.10 * h00 + (-1.45) * h01 + (-beach_slope * 0.32) * h10;
+                    let ocean_ripples = 0.03 * v * (nx * 8.0 * pi).cos();
+                    shelf_base + ocean_ripples
                 };
+
+                // Gentle, smoothly windowed natural sand ripples (fades out at dunes and deep ocean boundaries)
+                let swash_window = ((ny - 0.20) / 0.15).clamp(0.0, 1.0) * ((0.85 - ny) / 0.15).clamp(0.0, 1.0);
+                z += 0.02 * swash_window * (nx * 8.0 * pi + ny * 6.0 * pi).sin();
 
                 // Default bedrock: 0.45m below ground level in dunes/beach, or deep in seabed
                 let mut bedrock = (z - 0.45).max(-2.5);
@@ -276,12 +290,8 @@ impl Scenarios {
                     grid.current.soil_sat[idx] = 1.0;
                     grid.next.soil_sat[idx] = 1.0;
                 } else {
-                    // Damp sand in swash zone, dry on upper dunes
-                    let sat = if ny > 0.48 {
-                        0.55 * ((ny - 0.48) / 0.20).clamp(0.0, 1.0)
-                    } else {
-                        0.05
-                    };
+                    // Continuous damp sand moisture gradient without step discontinuities
+                    let sat = 0.05 + 0.50 * ((ny - 0.30) / 0.36).clamp(0.0, 1.0).powf(1.5);
                     grid.current.soil_sat[idx] = sat;
                     grid.next.soil_sat[idx] = sat;
                 }

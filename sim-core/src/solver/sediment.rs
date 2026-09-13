@@ -23,6 +23,12 @@ pub struct SedimentParams {
     pub phi_sat: f32,
     /// Number of iterative talus relaxation passes per step (default 2)
     pub talus_iterations: u32,
+    /// Baseline hydraulic conductivity / infiltration rate K_sat in m/s (default 0.015 m/s)
+    pub infiltration_rate: f32,
+    /// Soil moisture capillary diffusion rate (default 0.05)
+    pub soil_diffusion_rate: f32,
+    /// Soil moisture atmospheric drying rate per second (default 0.015)
+    pub soil_drying_rate: f32,
 }
 
 impl Default for SedimentParams {
@@ -37,57 +43,76 @@ impl Default for SedimentParams {
             phi_damp: 45.0f32.to_radians(),
             phi_sat: 22.0f32.to_radians(),
             talus_iterations: 2,
+            infiltration_rate: 0.015,
+            soil_diffusion_rate: 0.05,
+            soil_drying_rate: 0.015,
         }
     }
 }
 
 /// Performs a combined sediment dynamics step:
-/// 1. Soil saturation tracking
+/// 1. Soil saturation tracking and physical water infiltration into porous sand
 /// 2. Conservative suspended sediment advection and Exner equation bed evolution
 /// 3. Geotechnical multi-directional angle-of-repose talus collapse pass
 pub fn step_sediment(grid: &mut DoubleBufferedGrid, dt: f32, params: &SedimentParams) {
-    step_saturation(grid, dt);
+    step_saturation(grid, dt, params);
     step_exner_exchange(grid, dt, params);
     for _ in 0..params.talus_iterations {
         step_talus_collapse(grid, params);
     }
 }
 
-/// Updates soil moisture and saturation W_sat in [0.0, 1.0].
-/// Submerged cells become fully saturated (1.0).
+/// Updates soil moisture, saturation W_sat in [0.0, 1.0], and simulates physical water infiltration into porous sand.
+/// Unsaturated soil absorbs surface water h until saturated.
 /// Dry cells slowly dry out in the air or absorb moisture from wet neighbors.
-pub fn step_saturation(grid: &mut DoubleBufferedGrid, dt: f32) {
+pub fn step_saturation(grid: &mut DoubleBufferedGrid, dt: f32, params: &SedimentParams) {
     let width = grid.descriptor.grid_res_x;
     let height = grid.descriptor.grid_res_y;
 
     grid.apply_boundaries();
 
-    let drying_rate = 0.02f32; // Moisture drying per second
-    let diffusion_rate = 0.05f32; // Soil moisture capillary diffusion
+    let drying_rate = params.soil_drying_rate;
+    let diffusion_rate = params.soil_diffusion_rate;
+    let k_sat = params.infiltration_rate;
+    let porosity = params.porosity;
 
     for y in 1..(height - 1) {
         for x in 1..(width - 1) {
             let idx = grid.current.idx(x, y);
             let h = grid.current.h[idx];
+            let sat_c = grid.current.soil_sat[idx];
+            let z = grid.current.z_bed[idx];
+            let bedrock = grid.current.bedrock_z[idx];
+
+            let soil_depth = (z - bedrock).clamp(0.0, 0.20);
+            let h_capacity = soil_depth * porosity;
 
             if h > 1e-4 {
-                // Fully submerged soil is completely saturated
-                grid.next.soil_sat[idx] = 1.0;
+                let mut absorbed = 0.0f32;
+                let mut next_sat = 1.0f32;
+
+                if h_capacity > 0.005 && sat_c < 0.999 && k_sat > 0.0 {
+                    let room = (1.0 - sat_c) * h_capacity;
+                    let suction_mult = 1.0 + 2.0 * (1.0 - sat_c);
+                    let potential_flux = (k_sat * suction_mult * dt).min(h);
+                    absorbed = potential_flux.min(room);
+                    next_sat = (sat_c + absorbed / h_capacity).clamp(0.0, 1.0);
+                }
+
+                grid.next.h[idx] = (h - absorbed).max(0.0);
+                grid.next.soil_sat[idx] = next_sat;
             } else {
-                let sat_c = grid.current.soil_sat[idx];
                 let sat_l = grid.current.soil_sat[grid.current.idx(x - 1, y)];
                 let sat_r = grid.current.soil_sat[grid.current.idx(x + 1, y)];
                 let sat_t = grid.current.soil_sat[grid.current.idx(x, y - 1)];
                 let sat_b = grid.current.soil_sat[grid.current.idx(x, y + 1)];
 
-                // Capillary diffusion from wet neighbors
                 let laplacian = sat_l + sat_r + sat_t + sat_b - 4.0 * sat_c;
                 let next_sat = sat_c + (diffusion_rate * laplacian - drying_rate * sat_c) * dt;
                 grid.next.soil_sat[idx] = next_sat.clamp(0.0, 1.0);
+                grid.next.h[idx] = h;
             }
 
-            // Preserve other fields during saturation pass
-            grid.next.h[idx] = grid.current.h[idx];
             grid.next.u[idx] = grid.current.u[idx];
             grid.next.v[idx] = grid.current.v[idx];
             grid.next.z_bed[idx] = grid.current.z_bed[idx];
