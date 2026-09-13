@@ -4,21 +4,21 @@ struct SimDomain {
     max_elevation: f32,
     grid_res_x: u32,
     grid_res_y: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
+    world_origin_x: f32,
+    world_origin_y: f32,
+    world_origin_z: f32,
 }
 
 @group(0) @binding(0) var<uniform> domain: SimDomain;
 @group(0) @binding(1) var<uniform> dt: f32;
 
-// In buffers
+// In buffers (read-only for current time step)
 @group(0) @binding(2) var<storage, read> in_h: array<f32>;
 @group(0) @binding(3) var<storage, read> in_u: array<f32>;
 @group(0) @binding(4) var<storage, read> in_v: array<f32>;
 @group(0) @binding(5) var<storage, read> in_z: array<f32>;
 
-// Out buffers
+// Out buffers (written for next time step)
 @group(0) @binding(6) var<storage, read_write> out_h: array<f32>;
 @group(0) @binding(7) var<storage, read_write> out_u: array<f32>;
 @group(0) @binding(8) var<storage, read_write> out_v: array<f32>;
@@ -49,6 +49,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let width = domain.grid_res_x;
     let height = domain.grid_res_y;
 
+    // Interior domain only (ghost halo handled in boundary pass)
     if (x == 0u || x >= width - 1u || y == 0u || y >= height - 1u) {
         return;
     }
@@ -69,7 +70,18 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let h_t = in_h[idx_t]; let u_t = in_u[idx_t]; let v_t = in_v[idx_t]; let z_t = in_z[idx_t];
     let h_b = in_h[idx_b]; let u_b = in_u[idx_b]; let v_b = in_v[idx_b]; let z_b = in_z[idx_b];
 
-    // --- Hydrostatic Reconstruction (Audusse) ---
+    let h_dry = 1e-4;
+
+    // Fast path: dry cells remain at rest
+    if (h_c <= h_dry && h_l <= h_dry && h_r <= h_dry && h_t <= h_dry && h_b <= h_dry) {
+        out_h[idx] = max(0.0, h_c);
+        out_u[idx] = 0.0;
+        out_v[idx] = 0.0;
+        out_z[idx] = z_c;
+        return;
+    }
+
+    // --- Hydrostatic Reconstruction (Audusse et al.) ---
     let z_max_l = max(z_l, z_c);
     let h_l_xl = max(0.0, h_l + z_l - z_max_l);
     let h_r_xl = max(0.0, h_c + z_c - z_max_l);
@@ -128,7 +140,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         h_r_yb * v_b - h_l_yb * v_c
     );
 
-    // --- Source terms ---
+    // --- Source terms (Bed slope) ---
     let source_hu = 0.5 * G * (h_l_xr * h_l_xr - h_r_xl * h_r_xl) / dx;
     let source_hv = 0.5 * G * (h_l_yb * h_l_yb - h_r_yt * h_r_yt) / dy;
 
@@ -137,18 +149,28 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let dq_dt_total = dq_dt + vec3<f32>(0.0, source_hu, source_hv);
 
     var h_next = h_c + dq_dt_total.x * dt;
-    var hu_next = (h_c * u_c) + dq_dt_total.y * dt;
-    var hv_next = (h_c * v_c) + dq_dt_total.z * dt;
+    let hu_next = (h_c * u_c) + dq_dt_total.y * dt;
+    let hv_next = (h_c * v_c) + dq_dt_total.z * dt;
 
     var u_next = 0.0;
     var v_next = 0.0;
 
-    if (h_next < 1e-4) {
-        h_next = 0.0;
+    if (h_next <= h_dry) {
+        h_next = max(0.0, h_next);
+        u_next = 0.0;
+        v_next = 0.0;
     } else {
-        let friction = 0.999;
-        u_next = (hu_next / h_next) * friction;
-        v_next = (hv_next / h_next) * friction;
+        let raw_u = hu_next / h_next;
+        let raw_v = hv_next / h_next;
+
+        // Semi-implicit Manning friction drag
+        let speed = sqrt(raw_u * raw_u + raw_v * raw_v);
+        let manning_n = 0.025;
+        let h_eff = max(h_next, h_dry);
+        let drag = dt * G * manning_n * manning_n * speed / pow(h_eff, 4.0 / 3.0);
+        let friction_factor = 1.0 / (1.0 + drag);
+        u_next = raw_u * friction_factor;
+        v_next = raw_v * friction_factor;
     }
 
     out_h[idx] = h_next;
@@ -171,25 +193,54 @@ fn boundary(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     let idx = get_idx(x, y);
 
-    if (x == 0u) {
+    // 1. Four corners: diagonal reflection (handled first to avoid race conditions)
+    if (x == 0u && y == 0u) {
+        let idx_in = get_idx(1u, 1u);
+        out_h[idx] = out_h[idx_in];
+        out_z[idx] = out_z[idx_in];
+        out_u[idx] = -out_u[idx_in];
+        out_v[idx] = -out_v[idx_in];
+    } else if (x == width - 1u && y == 0u) {
+        let idx_in = get_idx(width - 2u, 1u);
+        out_h[idx] = out_h[idx_in];
+        out_z[idx] = out_z[idx_in];
+        out_u[idx] = -out_u[idx_in];
+        out_v[idx] = -out_v[idx_in];
+    } else if (x == 0u && y == height - 1u) {
+        let idx_in = get_idx(1u, height - 2u);
+        out_h[idx] = out_h[idx_in];
+        out_z[idx] = out_z[idx_in];
+        out_u[idx] = -out_u[idx_in];
+        out_v[idx] = -out_v[idx_in];
+    } else if (x == width - 1u && y == height - 1u) {
+        let idx_in = get_idx(width - 2u, height - 2u);
+        out_h[idx] = out_h[idx_in];
+        out_z[idx] = out_z[idx_in];
+        out_u[idx] = -out_u[idx_in];
+        out_v[idx] = -out_v[idx_in];
+    } else if (x == 0u) {
+        // Left boundary: invert normal velocity u, preserve tangential velocity v
         let idx_in = get_idx(1u, y);
         out_h[idx] = out_h[idx_in];
         out_z[idx] = out_z[idx_in];
         out_u[idx] = -out_u[idx_in];
         out_v[idx] = out_v[idx_in];
     } else if (x == width - 1u) {
+        // Right boundary: invert normal velocity u, preserve tangential velocity v
         let idx_in = get_idx(width - 2u, y);
         out_h[idx] = out_h[idx_in];
         out_z[idx] = out_z[idx_in];
         out_u[idx] = -out_u[idx_in];
         out_v[idx] = out_v[idx_in];
     } else if (y == 0u) {
+        // Top boundary: preserve tangential velocity u, invert normal velocity v
         let idx_in = get_idx(x, 1u);
         out_h[idx] = out_h[idx_in];
         out_z[idx] = out_z[idx_in];
         out_u[idx] = out_u[idx_in];
         out_v[idx] = -out_v[idx_in];
     } else if (y == height - 1u) {
+        // Bottom boundary: preserve tangential velocity u, invert normal velocity v
         let idx_in = get_idx(x, height - 2u);
         out_h[idx] = out_h[idx_in];
         out_z[idx] = out_z[idx_in];
