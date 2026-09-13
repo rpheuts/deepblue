@@ -25,10 +25,10 @@ enum FlowVisMode {
 impl FlowVisMode {
     fn next(self) -> Self {
         match self {
+            Self::Particles => Self::Both,
             Self::Both => Self::Vectors,
-            Self::Vectors => Self::Particles,
-            Self::Particles => Self::Off,
-            Self::Off => Self::Both,
+            Self::Vectors => Self::Off,
+            Self::Off => Self::Particles,
         }
     }
 
@@ -39,6 +39,54 @@ impl FlowVisMode {
             Self::Particles => "Particles (Tracers)",
             Self::Off => "Off",
         }
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+struct CameraState {
+    target_x: f32, // normalized center [0.0, 1.0]
+    target_y: f32,
+    zoom: f32,     // 1.0 = full view, up to 6.0x
+}
+
+impl CameraState {
+    fn new() -> Self {
+        Self {
+            target_x: 0.5,
+            target_y: 0.5,
+            zoom: 1.0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.target_x = 0.5;
+        self.target_y = 0.5;
+        self.zoom = 1.0;
+    }
+
+    /// Returns active view bounds in grid cells: (view_x, view_y, view_w, view_h)
+    fn view_bounds(&self, width: f32, height: f32) -> (f32, f32, f32, f32) {
+        let view_w = width / self.zoom;
+        let view_h = height / self.zoom;
+        let view_x = (self.target_x * width - view_w * 0.5).clamp(0.0, width - view_w);
+        let view_y = (self.target_y * height - view_h * 0.5).clamp(0.0, height - view_h);
+        (view_x, view_y, view_w, view_h)
+    }
+
+    /// Converts screen pixel coordinates to simulation grid cell coordinates
+    fn screen_to_grid(&self, sx: f32, sy: f32, screen_w: f32, screen_h: f32, grid_w: f32, grid_h: f32) -> (i32, i32) {
+        let (view_x, view_y, view_w, view_h) = self.view_bounds(grid_w, grid_h);
+        let gx = (view_x + (sx / screen_w) * view_w) as i32;
+        let gy = (view_y + (sy / screen_h) * view_h) as i32;
+        (gx, gy)
+    }
+
+    /// Converts grid coordinates to screen pixel coordinates
+    fn grid_to_screen(&self, gx: f32, gy: f32, screen_w: f32, screen_h: f32, grid_w: f32, grid_h: f32) -> (f32, f32) {
+        let (view_x, view_y, view_w, view_h) = self.view_bounds(grid_w, grid_h);
+        let sx = (gx - view_x) / view_w * screen_w;
+        let sy = (gy - view_y) / view_h * screen_h;
+        (sx, sy)
     }
 }
 
@@ -143,7 +191,7 @@ async fn main() {
     let mut is_inflow_active = true;
     let mut is_paused = false;
     let mut current_preset = ActivePreset::BeachStream;
-    let mut flow_vis_mode = FlowVisMode::Both;
+    let mut flow_vis_mode = FlowVisMode::Particles;
 
     // Fast texture blitting buffer
     let mut img = Image::gen_image_color(desc.grid_res_x as u16, desc.grid_res_y as u16, BLACK);
@@ -177,6 +225,9 @@ async fn main() {
             p
         })
         .collect();
+
+    let mut camera = CameraState::new();
+    let mut prev_mouse_pos = mouse_position();
 
     loop {
         // --- 1. Scenario Presets ---
@@ -284,22 +335,58 @@ async fn main() {
             is_paused = !is_paused;
         }
 
-        // --- 3. Interactive Mouse Tools ---
+        // --- 3. Camera Zoom & Pan Controls ---
         let (mx, my) = mouse_position();
         let mouse_in_window = mx >= 0.0 && mx < screen_width() && my >= 0.0 && my < screen_height();
 
-        if mouse_in_window {
-            let gx = (mx / screen_width() * desc.grid_res_x as f32) as i32;
-            let gy = (my / screen_height() * desc.grid_res_y as f32) as i32;
-            let radius = 10;
+        let wheel = mouse_wheel().1;
+        if wheel.abs() > 0.01 {
+            let prev_zoom = camera.zoom;
+            let factor = if wheel > 0.0 { 1.15 } else { 1.0 / 1.15 };
+            camera.zoom = (camera.zoom * factor).clamp(1.0, 6.0);
+
+            if (camera.zoom - prev_zoom).abs() > 1e-4 {
+                let norm_x = (mx / screen_width()).clamp(0.0, 1.0);
+                let norm_y = (my / screen_height()).clamp(0.0, 1.0);
+                camera.target_x += (norm_x - 0.5) * (1.0 / prev_zoom - 1.0 / camera.zoom);
+                camera.target_y += (norm_y - 0.5) * (1.0 / prev_zoom - 1.0 / camera.zoom);
+                camera.target_x = camera.target_x.clamp(0.0, 1.0);
+                camera.target_y = camera.target_y.clamp(0.0, 1.0);
+            }
+        }
+
+        if is_mouse_button_down(MouseButton::Middle) {
+            let dx = mx - prev_mouse_pos.0;
+            let dy = my - prev_mouse_pos.1;
+            camera.target_x -= (dx / screen_width()) / camera.zoom;
+            camera.target_y -= (dy / screen_height()) / camera.zoom;
+            camera.target_x = camera.target_x.clamp(0.0, 1.0);
+            camera.target_y = camera.target_y.clamp(0.0, 1.0);
+        }
+
+        let pan_step = 0.012 / camera.zoom;
+        if is_key_down(KeyCode::Left) { camera.target_x = (camera.target_x - pan_step).max(0.0); }
+        if is_key_down(KeyCode::Right) { camera.target_x = (camera.target_x + pan_step).min(1.0); }
+        if is_key_down(KeyCode::Up) { camera.target_y = (camera.target_y - pan_step).max(0.0); }
+        if is_key_down(KeyCode::Down) { camera.target_y = (camera.target_y + pan_step).min(1.0); }
+
+        if is_key_pressed(KeyCode::C) || is_key_pressed(KeyCode::Key0) {
+            camera.reset();
+        }
+
+        prev_mouse_pos = (mx, my);
+
+        // --- 4. Interactive Mouse Tools ---
+        if mouse_in_window && !is_mouse_button_down(MouseButton::Middle) {
+            let (gx, gy) = camera.screen_to_grid(mx, my, screen_width(), screen_height(), desc.grid_res_x as f32, desc.grid_res_y as f32);
+            let radius = (10.0 / camera.zoom.sqrt()).max(3.0) as i32;
             let r2 = radius * radius;
 
             let ctrl_down = is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl);
             let shift_down = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
 
             let add_water = is_mouse_button_down(MouseButton::Left) && !shift_down && !ctrl_down;
-            let build_sand_dam = (shift_down && is_mouse_button_down(MouseButton::Left))
-                || is_mouse_button_down(MouseButton::Middle);
+            let build_sand_dam = shift_down && is_mouse_button_down(MouseButton::Left);
             let dig_trench = is_mouse_button_down(MouseButton::Right) && !shift_down && !ctrl_down;
             let dump_sand = shift_down && is_mouse_button_down(MouseButton::Right);
             let place_stone_wall = ctrl_down && is_mouse_button_down(MouseButton::Left);
@@ -411,13 +498,18 @@ async fn main() {
         }
 
         let width = desc.grid_res_x as usize;
+        let height = desc.grid_res_y as usize;
         let row_bytes = width * 4;
+        let is_coastal_waves = current_preset == ActivePreset::BeachWaves;
 
         img.bytes
             .par_chunks_exact_mut(row_bytes)
             .enumerate()
             .for_each(|(y, row_slice)| {
                 let row_offset = y * width;
+                let y_prev_offset = if y > 0 { (y - 1) * width } else { y * width };
+                let y_next_offset = if y < height - 1 { (y + 1) * width } else { y * width };
+
                 for x in 0..width {
                     let idx = row_offset + x;
                     let byte_idx = x * 4;
@@ -427,7 +519,10 @@ async fn main() {
                     let sat = state.soil_sat[idx].clamp(0.0, 1.0);
                     let shade = shade_cache[idx];
 
-                    // Terrain color palette based on material & elevation
+                    let x_prev = if x > 0 { x - 1 } else { x };
+                    let x_next = if x < width - 1 { x + 1 } else { x };
+
+                    // 1. Terrain base material & elevation color
                     let is_stone_rock = (z - state.bedrock_z[idx]).abs() < 0.04 && state.bedrock_z[idx] > 0.25;
                     let (tr, tg, tb) = if is_stone_rock {
                         // Indestructible stone breakwater / masonry granite
@@ -443,59 +538,156 @@ async fn main() {
                         (160.0, 145.0, 130.0)
                     };
 
-                    // Soil moisture / saturation effect: wet sand darkens naturally
+                    // Soil moisture: wet sand darkens naturally
                     let moisture_darkening = 1.0 - 0.32 * sat;
                     let r_land = (tr * shade * moisture_darkening).clamp(0.0, 255.0);
                     let g_land = (tg * shade * moisture_darkening).clamp(0.0, 255.0);
                     let b_land = (tb * shade * moisture_darkening).clamp(0.0, 255.0);
 
                     if depth > 0.005 {
-                        // Distinct water depth gradient:
-                        // Shallow: clear, translucent turquoise (depth of riverbed clearly visible through it!)
-                        // Mid: rich tropical cyan/azure
-                        // Deep: deep ocean navy
-                        let (wr, wg, wb) = if depth < 0.12 {
-                            (40.0, 175.0, 205.0)
-                        } else if depth < 0.60 {
-                            (25.0, 110.0, 195.0)
-                        } else {
-                            (10.0, 45.0, 140.0)
-                        };
-
-                        // Suspended sediment tinting: muddy silty river brown where erosion occurs
-                        let c = state.sediment_c[idx].clamp(0.0, 0.5);
-                        let turbidity = (c / 0.08).clamp(0.0, 1.0);
-                        let (mud_r, mud_g, mud_b) = (165.0, 115.0, 65.0);
-                        let base_water_r = wr * (1.0 - turbidity) + mud_r * turbidity;
-                        let base_water_g = wg * (1.0 - turbidity) + mud_g * turbidity;
-                        let base_water_b = wb * (1.0 - turbidity) + mud_b * turbidity;
-
-                        // Rapids foam: ONLY appears in violent rapids or plunge pools (> 2.8 m/s),
-                        // capped at 45% max opacity so it never completely washes out the water color.
+                        // --- HIGH-FIDELITY WATER OPTICS & LIGHTING PASS ---
                         let u = state.u[idx];
                         let v = state.v[idx];
                         let speed_sq = u * u + v * v;
-                        let foam = if speed_sq > 7.84 {
-                            let speed = speed_sq.sqrt();
-                            ((speed - 2.8) / 3.0).clamp(0.0, 0.45)
+                        let speed = speed_sq.sqrt();
+
+                        // 3D Water Surface Normal & Slopes
+                        let eta_l = state.z_bed[row_offset + x_prev] + state.h[row_offset + x_prev];
+                        let eta_r = state.z_bed[row_offset + x_next] + state.h[row_offset + x_next];
+                        let eta_t = state.z_bed[y_prev_offset + x] + state.h[y_prev_offset + x];
+                        let eta_b = state.z_bed[y_next_offset + x] + state.h[y_next_offset + x];
+
+                        let deta_x = (eta_r - eta_l) * 0.5;
+                        let deta_y = (eta_b - eta_t) * 0.5;
+
+                        // A. Physical Beer-Lambert Optical Extinction
+                        // Red absorbs rapidly, green moderately, blue penetrates deepest
+                        let t_r = (-4.2 * depth).exp();
+                        let t_g = (-1.25 * depth).exp();
+                        let t_b = (-0.40 * depth).exp();
+
+                        // Deep water body in-scattering (tropical azure to deep oceanic sapphire)
+                        let deep_r = 10.0;
+                        let deep_g = 58.0;
+                        let deep_b = 148.0;
+                        let inscatter_r = deep_r * (1.0 - t_r);
+                        let inscatter_g = deep_g * (1.0 - t_g);
+                        let inscatter_b = deep_b * (1.0 - t_b);
+
+                        let mut water_r = r_land * t_r + inscatter_r;
+                        let mut water_g = g_land * t_g + inscatter_g;
+                        let mut water_b = b_land * t_b + inscatter_b;
+
+                        // B. Suspended Sediment Turbidity
+                        let c = state.sediment_c[idx].clamp(0.0, 0.5);
+                        let turbidity = (c / 0.08).clamp(0.0, 1.0);
+                        let (mud_r, mud_g, mud_b) = (165.0, 115.0, 65.0);
+                        water_r = water_r * (1.0 - turbidity) + mud_r * turbidity;
+                        water_g = water_g * (1.0 - turbidity) + mud_g * turbidity;
+                        water_b = water_b * (1.0 - turbidity) + mud_b * turbidity;
+
+                        // C. 3D Water Surface Normal & Specular Sun Glint
+                        let nx = -deta_x * 2.8;
+                        let ny = -deta_y * 2.8;
+                        let n_len = (nx * nx + ny * ny + 1.0).sqrt();
+                        let norm_x = nx / n_len;
+                        let norm_y = ny / n_len;
+                        let norm_z = 1.0 / n_len;
+
+                        // Sun Half-Vector H = (-0.209, -0.247, 0.946)
+                        let n_dot_h = (norm_x * (-0.209) + norm_y * (-0.247) + norm_z * 0.946).max(0.0);
+                        // Flat water (n_dot_h = 0.946) has zero specular glint, keeping still water clear.
+                        // Only wave facets tilted towards the sun sparkle with glints.
+                        let spec_sun = if n_dot_h > 0.960 {
+                            let t = (n_dot_h - 0.960) / (1.0 - 0.960);
+                            t.powi(12) * 1.6
                         } else {
                             0.0
                         };
 
-                        // Water transparency: shallow water is translucent (alpha ~ 0.38) so the riverbed shows through cleanly
-                        let water_alpha = (depth / 0.80).clamp(0.38, 0.92);
-                        let final_wr = base_water_r * (1.0 - foam) + 245.0 * foam;
-                        let final_wg = base_water_g * (1.0 - foam) + 250.0 * foam;
-                        let final_wb = base_water_b * (1.0 - foam) + 255.0 * foam;
+                        // Fresnel sky reflectance
+                        let one_minus_cos = (1.0 - norm_z).max(0.0);
+                        let fresnel = 0.04 + 0.96 * one_minus_cos.powi(4);
+                        let sky_r = 180.0;
+                        let sky_g = 215.0;
+                        let sky_b = 248.0;
 
-                        row_slice[byte_idx] = (r_land * (1.0 - water_alpha) + final_wr * water_alpha) as u8;
-                        row_slice[byte_idx + 1] = (g_land * (1.0 - water_alpha) + final_wg * water_alpha) as u8;
-                        row_slice[byte_idx + 2] = (b_land * (1.0 - water_alpha) + final_wb * water_alpha) as u8;
+                        water_r = water_r * (1.0 - fresnel * 0.45) + sky_r * (fresnel * 0.45);
+                        water_g = water_g * (1.0 - fresnel * 0.45) + sky_g * (fresnel * 0.45);
+                        water_b = water_b * (1.0 - fresnel * 0.45) + sky_b * (fresnel * 0.45);
+
+                        water_r += 255.0 * spec_sun;
+                        water_g += 248.0 * spec_sun;
+                        water_b += 220.0 * spec_sun;
+
+                        // D. Multi-Source Sea Foam (Only enabled for coastal waves preset)
+                        let foam = if is_coastal_waves {
+                            // 1. Breaker / rapids foam in high velocity ocean surge
+                            let rapids_foam = if speed > 2.2 {
+                                ((speed - 2.2) / 2.0).clamp(0.0, 0.85)
+                            } else {
+                                0.0
+                            };
+
+                            // 2. Shoreline lapping wave edge (wetting swash front)
+                            let shore_foam = if depth < 0.06 && v < -0.10 {
+                                ((-v - 0.10) / 0.40).clamp(0.0, 0.70)
+                            } else {
+                                0.0
+                            };
+
+                            // 3. Obstacle collision foam (slamming into rocks/castle walls)
+                            let dz_x = (state.z_bed[row_offset + x_next] - state.z_bed[row_offset + x_prev]) * 0.5;
+                            let dz_y = (state.z_bed[y_next_offset + x] - state.z_bed[y_prev_offset + x]) * 0.5;
+                            let obstacle_impact = -(u * dz_x + v * dz_y);
+                            let obstacle_foam = if obstacle_impact > 0.15 {
+                                ((obstacle_impact - 0.15) / 0.50).clamp(0.0, 0.75)
+                            } else {
+                                0.0
+                            };
+
+                            (rapids_foam + shore_foam + obstacle_foam).clamp(0.0, 0.92)
+                        } else {
+                            0.0
+                        };
+
+                        if foam > 0.001 {
+                            let foam_r = 248.0;
+                            let foam_g = 252.0;
+                            let foam_b = 255.0;
+                            row_slice[byte_idx] = (water_r * (1.0 - foam) + foam_r * foam).clamp(0.0, 255.0) as u8;
+                            row_slice[byte_idx + 1] = (water_g * (1.0 - foam) + foam_g * foam).clamp(0.0, 255.0) as u8;
+                            row_slice[byte_idx + 2] = (water_b * (1.0 - foam) + foam_b * foam).clamp(0.0, 255.0) as u8;
+                        } else {
+                            row_slice[byte_idx] = water_r.clamp(0.0, 255.0) as u8;
+                            row_slice[byte_idx + 1] = water_g.clamp(0.0, 255.0) as u8;
+                            row_slice[byte_idx + 2] = water_b.clamp(0.0, 255.0) as u8;
+                        }
                         row_slice[byte_idx + 3] = 255;
                     } else {
-                        row_slice[byte_idx] = r_land as u8;
-                        row_slice[byte_idx + 1] = g_land as u8;
-                        row_slice[byte_idx + 2] = b_land as u8;
+                        // --- DRY / EXPOSED LAND PASS ---
+                        let mut final_r = r_land;
+                        let mut final_g = g_land;
+                        let mut final_b = b_land;
+
+                        // Wet Sand Specular Gloss ("Mirror Beach")
+                        if sat > 0.40 {
+                            let dz_x = (state.z_bed[row_offset + x_next] - state.z_bed[row_offset + x_prev]) * 0.5;
+                            let dz_y = (state.z_bed[y_next_offset + x] - state.z_bed[y_prev_offset + x]) * 0.5;
+                            let land_nx = -dz_x * 2.0;
+                            let land_ny = -dz_y * 2.0;
+                            let land_len = (land_nx * land_nx + land_ny * land_ny + 1.0).sqrt();
+                            let land_dot_h = ((land_nx / land_len) * (-0.209) + (land_ny / land_len) * (-0.247) + (1.0 / land_len) * 0.946).max(0.0);
+                            let wet_spec = land_dot_h.powi(22) * (sat - 0.40) * 2.2;
+
+                            final_r = (final_r + 210.0 * wet_spec).min(255.0);
+                            final_g = (final_g + 225.0 * wet_spec).min(255.0);
+                            final_b = (final_b + 245.0 * wet_spec).min(255.0);
+                        }
+
+                        row_slice[byte_idx] = final_r as u8;
+                        row_slice[byte_idx + 1] = final_g as u8;
+                        row_slice[byte_idx + 2] = final_b as u8;
                         row_slice[byte_idx + 3] = 255;
                     }
                 }
@@ -503,6 +695,7 @@ async fn main() {
 
         texture.update(&img);
 
+        let (view_x, view_y, view_w, view_h) = camera.view_bounds(desc.grid_res_x as f32, desc.grid_res_y as f32);
         draw_texture_ex(
             &texture,
             0.0,
@@ -510,6 +703,7 @@ async fn main() {
             WHITE,
             DrawTextureParams {
                 dest_size: Some(vec2(screen_width(), screen_height())),
+                source: Some(Rect::new(view_x, view_y, view_w, view_h)),
                 ..Default::default()
             },
         );
@@ -521,7 +715,7 @@ async fn main() {
 
         // Mode: Flow Lines (Grid Vectors)
         if flow_vis_mode == FlowVisMode::Both || flow_vis_mode == FlowVisMode::Vectors {
-            let step: usize = 20;
+            let step: usize = (20.0 / camera.zoom.sqrt()).max(10.0) as usize;
             for gy in (step / 2..desc.grid_res_y as usize).step_by(step) {
                 for gx in (step / 2..desc.grid_res_x as usize).step_by(step) {
                     let idx = state.idx(gx as u32, gy as u32);
@@ -532,18 +726,25 @@ async fn main() {
                         let speed_sq = u * u + v * v;
                         if speed_sq > 0.0064 {
                             let speed = speed_sq.sqrt();
-                            let sx = (gx as f32 + 0.5) / desc.grid_res_x as f32 * screen_w;
-                            let sy = (gy as f32 + 0.5) / desc.grid_res_y as f32 * screen_h;
-                            let dir_x = u / speed;
-                            let dir_y = v / speed;
-                            // Flow line length scales directly with fluid speed (longer for faster water!)
-                            let len = (speed * 12.0).clamp(4.0, 24.0);
-                            let ex = sx + dir_x * len;
-                            let ey = sy + dir_y * len;
-                            let alpha = (speed / 1.5).clamp(0.30, 0.85);
+                            let (sx, sy) = camera.grid_to_screen(
+                                gx as f32 + 0.5,
+                                gy as f32 + 0.5,
+                                screen_w,
+                                screen_h,
+                                desc.grid_res_x as f32,
+                                desc.grid_res_y as f32,
+                            );
+                            if sx >= -20.0 && sx <= screen_w + 20.0 && sy >= -20.0 && sy <= screen_h + 20.0 {
+                                let dir_x = u / speed;
+                                let dir_y = v / speed;
+                                let len = (speed * 12.0 * camera.zoom.sqrt()).clamp(4.0, 36.0);
+                                let ex = sx + dir_x * len;
+                                let ey = sy + dir_y * len;
+                                let alpha = (speed / 1.5).clamp(0.30, 0.85);
 
-                            draw_line(sx, sy, ex, ey, 1.6, Color::new(0.70, 0.92, 1.0, alpha));
-                            draw_circle(ex, ey, 1.3, Color::new(1.0, 1.0, 1.0, alpha * 0.95));
+                                draw_line(sx, sy, ex, ey, 1.6, Color::new(0.70, 0.92, 1.0, alpha));
+                                draw_circle(ex, ey, 1.3, Color::new(1.0, 1.0, 1.0, alpha * 0.95));
+                            }
                         }
                     }
                 }
@@ -582,19 +783,35 @@ async fn main() {
                     }
                 }
 
-                let sx0 = p.prev_x / desc.grid_res_x as f32 * screen_w;
-                let sy0 = p.prev_y / desc.grid_res_y as f32 * screen_h;
-                let sx1 = p.x / desc.grid_res_x as f32 * screen_w;
-                let sy1 = p.y / desc.grid_res_y as f32 * screen_h;
+                let (sx0, sy0) = camera.grid_to_screen(
+                    p.prev_x,
+                    p.prev_y,
+                    screen_w,
+                    screen_h,
+                    desc.grid_res_x as f32,
+                    desc.grid_res_y as f32,
+                );
+                let (sx1, sy1) = camera.grid_to_screen(
+                    p.x,
+                    p.y,
+                    screen_w,
+                    screen_h,
+                    desc.grid_res_x as f32,
+                    desc.grid_res_y as f32,
+                );
 
-                let dist_sq = (sx1 - sx0).powi(2) + (sy1 - sy0).powi(2);
-                if dist_sq < 60.0 * 60.0 {
-                    let life_alpha = (p.life / p.max_life).clamp(0.0, 1.0);
-                    let speed_alpha = (p.speed / 1.0).clamp(0.25, 0.95);
-                    let alpha = life_alpha * speed_alpha;
-                    draw_line(sx0, sy0, sx1, sy1, 1.8, Color::new(0.88, 0.96, 1.0, alpha));
-                    if speed_alpha > 0.40 {
-                        draw_circle(sx1, sy1, 1.2, Color::new(1.0, 1.0, 1.0, alpha * 0.90));
+                if (sx0 >= -20.0 && sx0 <= screen_w + 20.0 && sy0 >= -20.0 && sy0 <= screen_h + 20.0)
+                    || (sx1 >= -20.0 && sx1 <= screen_w + 20.0 && sy1 >= -20.0 && sy1 <= screen_h + 20.0)
+                {
+                    let dist_sq = (sx1 - sx0).powi(2) + (sy1 - sy0).powi(2);
+                    if dist_sq < (60.0 * camera.zoom).powi(2) {
+                        let life_alpha = (p.life / p.max_life).clamp(0.0, 1.0);
+                        let speed_alpha = (p.speed / 1.0).clamp(0.25, 0.95);
+                        let alpha = life_alpha * speed_alpha;
+                        draw_line(sx0, sy0, sx1, sy1, (1.8 * camera.zoom.sqrt()).clamp(1.6, 4.0), Color::new(0.88, 0.96, 1.0, alpha));
+                        if speed_alpha > 0.40 {
+                            draw_circle(sx1, sy1, (1.2 * camera.zoom.sqrt()).clamp(1.2, 3.0), Color::new(1.0, 1.0, 1.0, alpha * 0.90));
+                        }
                     }
                 }
             }
@@ -608,8 +825,8 @@ async fn main() {
         }
 
         // Top bar
-        let hud_height = if current_preset == ActivePreset::BeachWaves { 166.0 } else { 148.0 };
-        draw_rectangle(8.0, 8.0, 630.0, hud_height, Color::new(0.0, 0.0, 0.0, 0.82));
+        let hud_height = if current_preset == ActivePreset::BeachWaves { 186.0 } else { 166.0 };
+        draw_rectangle(8.0, 8.0, 650.0, hud_height, Color::new(0.0, 0.0, 0.0, 0.84));
 
         draw_text(
             format!("FPS: {} | Backend: {}", get_fps(), sim.backend_name()).as_str(),
@@ -648,9 +865,20 @@ async fn main() {
         );
 
         draw_text(
-            "Keys: [1..4] Presets ([1] Stream, [2] Waves, [3] Dam, [4] Lake) | [R] Reset | [Space] Swap",
+            format!(
+                "Camera: [Scroll] Zoom ({:.1}x) | [MMB Drag / Arrows] Pan | [C] Reset View",
+                camera.zoom
+            ).as_str(),
             16.0,
             82.0,
+            13.0,
+            Color::new(0.35, 0.88, 1.0, 1.0),
+        );
+
+        draw_text(
+            "Keys: [1..4] Presets ([1] Stream, [2] Waves, [3] Dam, [4] Lake) | [R] Reset | [Space] Swap",
+            16.0,
+            98.0,
             13.0,
             LIGHTGRAY,
         );
@@ -661,7 +889,7 @@ async fn main() {
                 flow_vis_mode.label()
             ).as_str(),
             16.0,
-            98.0,
+            114.0,
             13.0,
             GOLD,
         );
@@ -674,7 +902,7 @@ async fn main() {
                 cached_max_c * 100.0
             ).as_str(),
             16.0,
-            114.0,
+            130.0,
             13.0,
             SKYBLUE,
         );
@@ -682,7 +910,7 @@ async fn main() {
         draw_text(
             format!("CFL Max dt: {:.4}s | Sub-step dt: {:.4}s", safe_dt, current_sub_dt).as_str(),
             16.0,
-            130.0,
+            146.0,
             12.0,
             DARKGRAY,
         );
@@ -710,7 +938,7 @@ async fn main() {
             draw_text(
                 format!("Coastal Dynamics: Wave [{}] | Tide [{}] | Sim Time: {:.1}s", wave_state, tide_state, t).as_str(),
                 16.0,
-                150.0,
+                166.0,
                 13.0,
                 ORANGE,
             );

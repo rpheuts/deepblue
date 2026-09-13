@@ -188,5 +188,5 @@ Support adaptive sub-stepping to prevent solver explosions when flow velocities 
 * [x] Interactive stone masonry placement brush ([Ctrl+LMB]) and stone demolition brush ([Ctrl+RMB]), complementing sand dams ([Shift+LMB]), digging ([RMB]), and fluid addition ([LMB]).
 
 * [ ] **Phase 5: Render Adapter Prototypes**
-* [x] 2D orthographic debug canvas (`sim-client-2d`) with depth gradients, turbidity, foam, directional hillshade, velocity vectors, Lagrangian tracer particles, and real-time coastal wave/tide telemetry.
+* [x] 2D high-fidelity canvas (`sim-client-2d`) with physical Beer-Lambert optical extinction, animated underwater caustics, 3D water surface normal reconstruction, Blinn-Phong specular sun glitter, Fresnel sky reflections, multi-source shoreline/rapids foam, wet sand gloss ("mirror beach"), and interactive camera zoom & pan.
 * [ ] 3D vertex-displaced mesh proof-of-concept consuming exported simulation textures (`ElevationMap`, `WaterMap`, `VelocityMap`).
