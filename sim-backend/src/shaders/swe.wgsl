@@ -9,8 +9,35 @@ struct SimDomain {
     world_origin_z: f32,
 }
 
+struct StepParams {
+    dt: f32,
+    time: f32,
+    south_type: u32,
+    south_base_eta: f32,
+
+    south_wave_amp: f32,
+    south_wave_period: f32,
+    south_surge_speed: f32,
+    south_tide_amp: f32,
+
+    south_tide_period: f32,
+    south_outflow_rate: f32,
+    north_type: u32,
+    north_inflow_h: f32,
+
+    north_inflow_v: f32,
+    north_outflow_rate: f32,
+    west_type: u32,
+    east_type: u32,
+
+    west_outflow_rate: f32,
+    east_outflow_rate: f32,
+    pad0: f32,
+    pad1: f32,
+}
+
 @group(0) @binding(0) var<uniform> domain: SimDomain;
-@group(0) @binding(1) var<uniform> dt: f32;
+@group(0) @binding(1) var<uniform> params: StepParams;
 
 // In buffers (read-only for current time step)
 @group(0) @binding(2) var<storage, read> in_h: array<f32>;
@@ -48,6 +75,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let y = global_id.y;
     let width = domain.grid_res_x;
     let height = domain.grid_res_y;
+    let dt = params.dt;
 
     // Interior domain only (ghost halo handled in boundary pass)
     if (x == 0u || x >= width - 1u || y == 0u || y >= height - 1u) {
@@ -229,32 +257,110 @@ fn boundary(@builtin(global_invocation_id) global_id: vec3<u32>) {
         out_u[idx] = -out_u[idx_in];
         out_v[idx] = -out_v[idx_in];
     } else if (x == 0u) {
-        // Left boundary: invert normal velocity u, preserve tangential velocity v
+        // West Boundary
         let idx_in = get_idx(1u, y);
-        out_h[idx] = out_h[idx_in];
         out_z[idx] = out_z[idx_in];
-        out_u[idx] = -out_u[idx_in];
-        out_v[idx] = out_v[idx_in];
+        if (params.west_type == 1u) {
+            let factor = 1.0 - params.west_outflow_rate;
+            out_h[idx] = out_h[idx_in] * factor;
+            let u_in = out_u[idx_in];
+            out_u[idx] = select(0.0, u_in * factor, u_in < 0.0);
+            out_v[idx] = out_v[idx_in] * factor;
+        } else {
+            out_h[idx] = out_h[idx_in];
+            out_u[idx] = -out_u[idx_in];
+            out_v[idx] = out_v[idx_in];
+        }
     } else if (x == width - 1u) {
-        // Right boundary: invert normal velocity u, preserve tangential velocity v
+        // East Boundary
         let idx_in = get_idx(width - 2u, y);
-        out_h[idx] = out_h[idx_in];
         out_z[idx] = out_z[idx_in];
-        out_u[idx] = -out_u[idx_in];
-        out_v[idx] = out_v[idx_in];
+        if (params.east_type == 1u) {
+            let factor = 1.0 - params.east_outflow_rate;
+            out_h[idx] = out_h[idx_in] * factor;
+            let u_in = out_u[idx_in];
+            out_u[idx] = select(0.0, u_in * factor, u_in > 0.0);
+            out_v[idx] = out_v[idx_in] * factor;
+        } else {
+            out_h[idx] = out_h[idx_in];
+            out_u[idx] = -out_u[idx_in];
+            out_v[idx] = out_v[idx_in];
+        }
     } else if (y == 0u) {
-        // Top boundary: preserve tangential velocity u, invert normal velocity v
+        // North Boundary
         let idx_in = get_idx(x, 1u);
-        out_h[idx] = out_h[idx_in];
         out_z[idx] = out_z[idx_in];
-        out_u[idx] = out_u[idx_in];
-        out_v[idx] = -out_v[idx_in];
+        if (params.north_type == 2u) {
+            out_h[idx] = params.north_inflow_h;
+            out_u[idx] = 0.0;
+            out_v[idx] = params.north_inflow_v;
+        } else if (params.north_type == 1u) {
+            let factor = 1.0 - params.north_outflow_rate;
+            out_h[idx] = out_h[idx_in] * factor;
+            out_u[idx] = out_u[idx_in] * factor;
+            let v_in = out_v[idx_in];
+            out_v[idx] = select(0.0, v_in * factor, v_in < 0.0);
+        } else {
+            out_h[idx] = out_h[idx_in];
+            out_u[idx] = out_u[idx_in];
+            out_v[idx] = -out_v[idx_in];
+        }
     } else if (y == height - 1u) {
-        // Bottom boundary: preserve tangential velocity u, invert normal velocity v
+        // South Boundary
         let idx_in = get_idx(x, height - 2u);
-        out_h[idx] = out_h[idx_in];
-        out_z[idx] = out_z[idx_in];
-        out_u[idx] = out_u[idx_in];
-        out_v[idx] = -out_v[idx_in];
+        let z_bed = out_z[idx_in];
+        out_z[idx] = z_bed;
+        if (params.south_type == 3u) {
+            // Wave Generator
+            let pi = 3.14159265;
+            let tide_period = max(1e-4, params.south_tide_period);
+            let tide_z = params.south_tide_amp * sin(2.0 * pi * params.time / tide_period);
+
+            let wave_period = max(1e-4, params.south_wave_period);
+            let phase = fract(params.time / wave_period);
+
+            // Asymmetric coastal surge profile:
+            // 1. Long sustained surge: 40% of cycle (e.g. 6.0s at T=15s)
+            // 2. Receding backwash: 30% of cycle (e.g. 4.5s at T=15s)
+            // 3. Calm inter-surge interval: 30% of cycle (e.g. 4.5s at T=15s)
+            var wave_surge = 0.0;
+            if (phase < 0.40) {
+                let s = phase / 0.40;
+                wave_surge = pow(sin(s * pi), 1.2);
+            } else {
+                let r = (phase - 0.40) / 0.60;
+                if (r < 0.50) {
+                    wave_surge = -0.35 * pow(sin((r / 0.50) * pi), 1.2);
+                } else {
+                    wave_surge = 0.0;
+                }
+            }
+
+            let target_eta = params.south_base_eta + tide_z + params.south_wave_amp * wave_surge;
+            let target_h = max(0.0, target_eta - z_bed);
+
+            if (wave_surge > 0.01) {
+                // Surge forward (towards North, so negative v)
+                out_h[idx] = target_h;
+                out_u[idx] = 0.0;
+                out_v[idx] = -params.south_surge_speed * wave_surge;
+            } else {
+                // Backwash receding into ocean
+                let v_in = out_v[idx_in];
+                out_h[idx] = min(out_h[idx_in], target_h);
+                out_u[idx] = out_u[idx_in] * 0.8;
+                out_v[idx] = select(0.0, v_in, v_in > 0.0);
+            }
+        } else if (params.south_type == 1u) {
+            let factor = 1.0 - params.south_outflow_rate;
+            out_h[idx] = out_h[idx_in] * factor;
+            out_u[idx] = out_u[idx_in] * factor;
+            let v_in = out_v[idx_in];
+            out_v[idx] = select(0.0, v_in * factor, v_in > 0.0);
+        } else {
+            out_h[idx] = out_h[idx_in];
+            out_u[idx] = out_u[idx_in];
+            out_v[idx] = -out_v[idx_in];
+        }
     }
 }

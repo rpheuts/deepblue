@@ -9,8 +9,12 @@ struct SimDomain {
     world_origin_z: f32,
 }
 
+struct StepParams {
+    dt: f32,
+}
+
 @group(0) @binding(0) var<uniform> domain: SimDomain;
-@group(0) @binding(1) var<uniform> dt: f32;
+@group(0) @binding(1) var<uniform> params: StepParams;
 
 // 3 storage buffers: 2 read + 1 write
 @group(0) @binding(2) var<storage, read> in_h: array<f32>;
@@ -27,6 +31,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let y = global_id.y;
     let width = domain.grid_res_x;
     let height = domain.grid_res_y;
+    let dt = params.dt;
 
     if (x == 0u || x >= width - 1u || y == 0u || y >= height - 1u) {
         return;

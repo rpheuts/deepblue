@@ -9,6 +9,7 @@ use sim_backend::WgpuSimulator;
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum ActivePreset {
     BeachStream,
+    BeachWaves,
     DamBreak,
     LakeAtRest,
 }
@@ -82,7 +83,7 @@ fn respawn_particle(
     p.speed = 0.0;
 
     // Sample randomly to find active flowing water
-    for _ in 0..14 {
+    for _ in 0..20 {
         let gx = rng.range_f32(2.0, (width - 3) as f32) as u32;
         let gy = rng.range_f32(2.0, (height - 3) as f32) as u32;
         let idx = state.idx(gx, gy);
@@ -95,9 +96,9 @@ fn respawn_particle(
         }
     }
 
-    // Fallback: spawn near upper river inlet
-    p.x = width as f32 * 0.5 + rng.range_f32(-10.0, 10.0);
-    p.y = height as f32 * 0.08 + rng.range_f32(0.0, 15.0);
+    // Fallback: spawn in lower or middle domain
+    p.x = rng.range_f32(10.0, (width - 10) as f32);
+    p.y = rng.range_f32(height as f32 * 0.35, height as f32 * 0.85);
     p.prev_x = p.x;
     p.prev_y = p.y;
 }
@@ -193,6 +194,19 @@ async fn main() {
             current_preset = ActivePreset::BeachStream;
             bed_dirty = true;
         } else if is_key_pressed(KeyCode::Key2) {
+            let grid = Scenarios::beach_sandcastle_waves(desc);
+            sim = if is_gpu {
+                Box::new(WgpuSimulator::new(grid).await)
+            } else {
+                Box::new(CpuSimulator::new(grid))
+            };
+            for p in &mut particles {
+                respawn_particle(p, sim.current_state(), &mut rng, desc.grid_res_x, desc.grid_res_y);
+            }
+            is_inflow_active = false;
+            current_preset = ActivePreset::BeachWaves;
+            bed_dirty = true;
+        } else if is_key_pressed(KeyCode::Key3) {
             let grid = Scenarios::dam_break(desc);
             sim = if is_gpu {
                 Box::new(WgpuSimulator::new(grid).await)
@@ -205,7 +219,7 @@ async fn main() {
             is_inflow_active = false;
             current_preset = ActivePreset::DamBreak;
             bed_dirty = true;
-        } else if is_key_pressed(KeyCode::Key3) {
+        } else if is_key_pressed(KeyCode::Key4) {
             let grid = Scenarios::lake_at_rest(desc);
             sim = if is_gpu {
                 Box::new(WgpuSimulator::new(grid).await)
@@ -222,6 +236,7 @@ async fn main() {
             // Reset current preset
             let grid = match current_preset {
                 ActivePreset::BeachStream => Scenarios::beach_stream(desc),
+                ActivePreset::BeachWaves => Scenarios::beach_sandcastle_waves(desc),
                 ActivePreset::DamBreak => Scenarios::dam_break(desc),
                 ActivePreset::LakeAtRest => Scenarios::lake_at_rest(desc),
             };
@@ -243,6 +258,8 @@ async fn main() {
                 current: sim.current_state().clone(),
                 next: sim.previous_state().clone(),
                 descriptor: *sim.descriptor(),
+                boundaries: *sim.boundaries(),
+                time: sim.sim_time(),
             };
 
             if is_gpu {
@@ -277,13 +294,18 @@ async fn main() {
             let radius = 10;
             let r2 = radius * radius;
 
-            let add_water = is_mouse_button_down(MouseButton::Left) && !is_key_down(KeyCode::LeftShift);
-            let build_dam = (is_key_down(KeyCode::LeftShift) && is_mouse_button_down(MouseButton::Left))
-                || is_mouse_button_down(MouseButton::Middle);
-            let dig_trench = is_mouse_button_down(MouseButton::Right) && !is_key_down(KeyCode::LeftShift);
-            let dump_sand = is_key_down(KeyCode::LeftShift) && is_mouse_button_down(MouseButton::Right);
+            let ctrl_down = is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl);
+            let shift_down = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
 
-            if add_water || build_dam || dig_trench || dump_sand {
+            let add_water = is_mouse_button_down(MouseButton::Left) && !shift_down && !ctrl_down;
+            let build_sand_dam = (shift_down && is_mouse_button_down(MouseButton::Left))
+                || is_mouse_button_down(MouseButton::Middle);
+            let dig_trench = is_mouse_button_down(MouseButton::Right) && !shift_down && !ctrl_down;
+            let dump_sand = shift_down && is_mouse_button_down(MouseButton::Right);
+            let place_stone_wall = ctrl_down && is_mouse_button_down(MouseButton::Left);
+            let demolish_stone = ctrl_down && is_mouse_button_down(MouseButton::Right);
+
+            if add_water || build_sand_dam || dig_trench || dump_sand || place_stone_wall || demolish_stone {
                 for dy in -radius..=radius {
                     for dx in -radius..=radius {
                         if dx * dx + dy * dy <= r2 {
@@ -293,7 +315,7 @@ async fn main() {
 
                             if add_water {
                                 sim.current_state_mut().h[idx] += 0.3;
-                            } else if build_dam {
+                            } else if build_sand_dam {
                                 sim.current_state_mut().z_bed[idx] += 0.12;
                             } else if dump_sand {
                                 // Dump loose erodible sand
@@ -303,11 +325,20 @@ async fn main() {
                                 let cur_z = sim.current_state().z_bed[idx];
                                 let bedrock = sim.current_state().bedrock_z[idx];
                                 sim.current_state_mut().z_bed[idx] = (cur_z - 0.12).max(bedrock);
+                            } else if place_stone_wall {
+                                // Indestructible stone masonry / breakwater: raise both z_bed and bedrock_z
+                                sim.current_state_mut().z_bed[idx] += 0.15;
+                                sim.current_state_mut().bedrock_z[idx] = sim.current_state().z_bed[idx];
+                            } else if demolish_stone {
+                                // Demolish stone breakwater down
+                                let cur_z = sim.current_state().z_bed[idx];
+                                sim.current_state_mut().z_bed[idx] = (cur_z - 0.15).max(-1.0);
+                                sim.current_state_mut().bedrock_z[idx] = (sim.current_state().z_bed[idx] - 0.45).max(-1.5);
                             }
                         }
                     }
                 }
-                if add_water && !build_dam && !dig_trench && !dump_sand {
+                if add_water && !build_sand_dam && !dig_trench && !dump_sand && !place_stone_wall && !demolish_stone {
                     sim.upload_water_depth();
                 } else {
                     sim.upload_state();
@@ -353,7 +384,8 @@ async fn main() {
             // Adaptive sub-stepping: compute maximum safe dt according to CFL (target CFL = 0.45)
             let max_cfl_dt = sim.compute_max_stable_dt(0.45);
             safe_dt = max_cfl_dt;
-            let frame_sim_time = 0.012f32;
+            // Frame simulation duration clamped to ensure true 1:1 real-time pacing across variable refresh rates
+            let frame_sim_time = get_frame_time().clamp(0.003, 0.016);
             current_sub_dt = frame_sim_time.min(max_cfl_dt.min(0.004));
             sim.step_subdivided(frame_sim_time, current_sub_dt);
         }
@@ -395,8 +427,12 @@ async fn main() {
                     let sat = state.soil_sat[idx].clamp(0.0, 1.0);
                     let shade = shade_cache[idx];
 
-                    // Terrain color palette based on elevation
-                    let (tr, tg, tb) = if z < 0.9 {
+                    // Terrain color palette based on material & elevation
+                    let is_stone_rock = (z - state.bedrock_z[idx]).abs() < 0.04 && state.bedrock_z[idx] > 0.25;
+                    let (tr, tg, tb) = if is_stone_rock {
+                        // Indestructible stone breakwater / masonry granite
+                        (120.0, 125.0, 135.0)
+                    } else if z < 0.9 {
                         // Moist gravel / wet sand
                         (155.0, 130.0, 95.0)
                     } else if z < 2.2 {
@@ -572,10 +608,11 @@ async fn main() {
         }
 
         // Top bar
-        draw_rectangle(8.0, 8.0, 540.0, 134.0, Color::new(0.0, 0.0, 0.0, 0.80));
+        let hud_height = if current_preset == ActivePreset::BeachWaves { 166.0 } else { 148.0 };
+        draw_rectangle(8.0, 8.0, 630.0, hud_height, Color::new(0.0, 0.0, 0.0, 0.82));
 
         draw_text(
-            format!("FPS: {} | Backend: {}", get_fps(), sim.backend_name()),
+            format!("FPS: {} | Backend: {}", get_fps(), sim.backend_name()).as_str(),
             16.0,
             28.0,
             20.0,
@@ -584,6 +621,7 @@ async fn main() {
 
         let preset_name = match current_preset {
             ActivePreset::BeachStream => "Beach Stream (Flowing & Carving)",
+            ActivePreset::BeachWaves => "Coastal Beach & Sandcastle Waves",
             ActivePreset::DamBreak => "Dam Break",
             ActivePreset::LakeAtRest => "Lake at Rest",
         };
@@ -594,7 +632,7 @@ async fn main() {
                 preset_name,
                 if is_inflow_active { "ON" } else { "OFF" },
                 if is_paused { "PAUSED" } else { "RUNNING" }
-            ),
+            ).as_str(),
             16.0,
             48.0,
             16.0,
@@ -602,18 +640,18 @@ async fn main() {
         );
 
         draw_text(
-            "Tools: [LMB] Water | [RMB] Dig | [Shift+LMB] Dam | [Shift+RMB] Sand",
+            "Tools: [LMB] Water | [RMB] Dig | [Shift+LMB] Sand | [Ctrl+LMB] Stone | [Ctrl+RMB] Break",
             16.0,
-            68.0,
-            15.0,
+            66.0,
+            14.0,
             GREEN,
         );
 
         draw_text(
-            "Keys: [1..3] Presets | [R] Reset | [I] Inflow | [P] Pause | [Space] Swap",
+            "Keys: [1..4] Presets ([1] Stream, [2] Waves, [3] Dam, [4] Lake) | [R] Reset | [Space] Swap",
             16.0,
-            86.0,
-            14.0,
+            82.0,
+            13.0,
             LIGHTGRAY,
         );
 
@@ -621,10 +659,10 @@ async fn main() {
             format!(
                 "Flow Vis: {} ([V] cycle)",
                 flow_vis_mode.label()
-            ),
+            ).as_str(),
             16.0,
-            104.0,
-            14.0,
+            98.0,
+            13.0,
             GOLD,
         );
 
@@ -634,20 +672,49 @@ async fn main() {
                 cached_fluid_mass,
                 cached_sed_mass,
                 cached_max_c * 100.0
-            ),
+            ).as_str(),
             16.0,
-            120.0,
-            14.0,
+            114.0,
+            13.0,
             SKYBLUE,
         );
 
         draw_text(
-            format!("CFL Max dt: {:.4}s | Sub-step dt: {:.4}s", safe_dt, current_sub_dt),
+            format!("CFL Max dt: {:.4}s | Sub-step dt: {:.4}s", safe_dt, current_sub_dt).as_str(),
             16.0,
-            136.0,
+            130.0,
             12.0,
             DARKGRAY,
         );
+
+        if current_preset == ActivePreset::BeachWaves {
+            let t = sim.sim_time();
+            let wave_period = 15.0f32;
+            let phase = (t / wave_period).rem_euclid(1.0);
+            let tide_phase = (2.0 * std::f32::consts::PI * t / 90.0).sin();
+
+            let wave_state = if phase < 0.40 {
+                let left = (0.40 - phase) * wave_period;
+                format!("Surging Onshore >> ({:.1}s left)", left)
+            } else {
+                let r = (phase - 0.40) / 0.60;
+                if r < 0.50 {
+                    let left = (0.50 - r) * 0.60 * wave_period;
+                    format!("<< Receding Backwash ({:.1}s)", left)
+                } else {
+                    let next_in = (1.0 - phase) * wave_period;
+                    format!("Calm Inter-surge Rest (Next swell in {:.1}s)", next_in)
+                }
+            };
+            let tide_state = if tide_phase > 0.0 { "High/Rising Tide" } else { "Low/Ebb Tide" };
+            draw_text(
+                format!("Coastal Dynamics: Wave [{}] | Tide [{}] | Sim Time: {:.1}s", wave_state, tide_state, t).as_str(),
+                16.0,
+                150.0,
+                13.0,
+                ORANGE,
+            );
+        }
 
         next_frame().await
     }

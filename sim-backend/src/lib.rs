@@ -5,6 +5,127 @@ use sim_core::state::GridState;
 use wgpu::util::DeviceExt;
 use std::borrow::Cow;
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuStepParams {
+    pub dt: f32,
+    pub time: f32,
+    pub south_type: u32,
+    pub south_base_eta: f32,
+
+    pub south_wave_amp: f32,
+    pub south_wave_period: f32,
+    pub south_surge_speed: f32,
+    pub south_tide_amp: f32,
+
+    pub south_tide_period: f32,
+    pub south_outflow_rate: f32,
+    pub north_type: u32,
+    pub north_inflow_h: f32,
+
+    pub north_inflow_v: f32,
+    pub north_outflow_rate: f32,
+    pub west_type: u32,
+    pub east_type: u32,
+
+    pub west_outflow_rate: f32,
+    pub east_outflow_rate: f32,
+    pub pad0: f32,
+    pub pad1: f32,
+}
+
+impl GpuStepParams {
+    pub fn new(dt: f32, time: f32, b: &sim_core::boundary::DomainBoundaryConfig) -> Self {
+        let mut p = Self {
+            dt,
+            time,
+            south_type: 0,
+            south_base_eta: 0.0,
+            south_wave_amp: 0.0,
+            south_wave_period: 4.0,
+            south_surge_speed: 0.0,
+            south_tide_amp: 0.0,
+            south_tide_period: 60.0,
+            south_outflow_rate: 0.0,
+
+            north_type: 0,
+            north_inflow_h: 0.0,
+            north_inflow_v: 0.0,
+            north_outflow_rate: 0.0,
+
+            west_type: 0,
+            east_type: 0,
+            west_outflow_rate: 0.0,
+            east_outflow_rate: 0.0,
+            pad0: 0.0,
+            pad1: 0.0,
+        };
+
+        match b.south {
+            sim_core::boundary::EdgeBoundary::SolidWall => p.south_type = 0,
+            sim_core::boundary::EdgeBoundary::OpenOutflow { absorption_rate } => {
+                p.south_type = 1;
+                p.south_outflow_rate = absorption_rate;
+            }
+            sim_core::boundary::EdgeBoundary::ConstantInflow { target_depth, inflow_velocity } => {
+                p.south_type = 2;
+                p.south_base_eta = target_depth;
+                p.south_surge_speed = inflow_velocity;
+            }
+            sim_core::boundary::EdgeBoundary::WaveGenerator {
+                base_elevation,
+                wave_amplitude,
+                wave_period,
+                surge_speed,
+                tide_amplitude,
+                tide_period,
+            } => {
+                p.south_type = 3;
+                p.south_base_eta = base_elevation;
+                p.south_wave_amp = wave_amplitude;
+                p.south_wave_period = wave_period;
+                p.south_surge_speed = surge_speed;
+                p.south_tide_amp = tide_amplitude;
+                p.south_tide_period = tide_period;
+            }
+        }
+
+        match b.north {
+            sim_core::boundary::EdgeBoundary::SolidWall => p.north_type = 0,
+            sim_core::boundary::EdgeBoundary::OpenOutflow { absorption_rate } => {
+                p.north_type = 1;
+                p.north_outflow_rate = absorption_rate;
+            }
+            sim_core::boundary::EdgeBoundary::ConstantInflow { target_depth, inflow_velocity } => {
+                p.north_type = 2;
+                p.north_inflow_h = target_depth;
+                p.north_inflow_v = inflow_velocity;
+            }
+            _ => p.north_type = 0,
+        }
+
+        match b.west {
+            sim_core::boundary::EdgeBoundary::SolidWall => p.west_type = 0,
+            sim_core::boundary::EdgeBoundary::OpenOutflow { absorption_rate } => {
+                p.west_type = 1;
+                p.west_outflow_rate = absorption_rate;
+            }
+            _ => p.west_type = 0,
+        }
+
+        match b.east {
+            sim_core::boundary::EdgeBoundary::SolidWall => p.east_type = 0,
+            sim_core::boundary::EdgeBoundary::OpenOutflow { absorption_rate } => {
+                p.east_type = 1;
+                p.east_outflow_rate = absorption_rate;
+            }
+            _ => p.east_type = 0,
+        }
+
+        p
+    }
+}
+
 pub struct WgpuSimulator {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -163,12 +284,10 @@ impl WgpuSimulator {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let dt = 0.016f32;
-        let mut dt_padded = [0u8; 16];
-        dt_padded[0..4].copy_from_slice(bytemuck::bytes_of(&dt));
+        let initial_params = GpuStepParams::new(0.016, cpu_grid.time, &cpu_grid.boundaries);
         let buf_dt = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Dt Buffer"),
-            contents: &dt_padded,
+            label: Some("Step Params Buffer"),
+            contents: bytemuck::bytes_of(&initial_params),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -395,7 +514,9 @@ impl WgpuSimulator {
 
     /// Advances the GPU compute simulation forward by a single time step `dt`.
     pub fn step(&mut self, dt: f32) {
-        self.queue.write_buffer(&self.buf_dt, 0, bytemuck::bytes_of(&dt));
+        self.cpu_grid.time += dt;
+        let gpu_params = GpuStepParams::new(dt, self.cpu_grid.time, &self.cpu_grid.boundaries);
+        self.queue.write_buffer(&self.buf_dt, 0, bytemuck::bytes_of(&gpu_params));
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         let workgroups_x = self.cpu_grid.descriptor.grid_res_x.div_ceil(16);
@@ -577,10 +698,12 @@ impl WgpuSimulator {
         if total_dt <= 1e-6 {
             return;
         }
+        self.cpu_grid.time += total_dt;
         let steps = (total_dt / max_sub_dt).ceil().max(1.0) as usize;
         let dt = total_dt / steps as f32;
 
-        self.queue.write_buffer(&self.buf_dt, 0, bytemuck::bytes_of(&dt));
+        let gpu_params = GpuStepParams::new(dt, self.cpu_grid.time, &self.cpu_grid.boundaries);
+        self.queue.write_buffer(&self.buf_dt, 0, bytemuck::bytes_of(&gpu_params));
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Subdivided Compute Passes"),
@@ -710,6 +833,18 @@ impl SimulationBackend for WgpuSimulator {
         let dy = self.cpu_grid.descriptor.extent_y / self.cpu_grid.descriptor.grid_res_y as f32;
         sim_core::solver::swe::compute_max_stable_dt(&self.cpu_grid.current, dx, dy, cfl, 9.81)
     }
+
+    fn boundaries(&self) -> &sim_core::boundary::DomainBoundaryConfig {
+        &self.cpu_grid.boundaries
+    }
+
+    fn set_boundaries(&mut self, boundaries: sim_core::boundary::DomainBoundaryConfig) {
+        self.cpu_grid.boundaries = boundaries;
+    }
+
+    fn sim_time(&self) -> f32 {
+        self.cpu_grid.time
+    }
 }
 
 #[cfg(test)]
@@ -829,5 +964,47 @@ mod tests {
             let b = sim.current_state().bedrock_z[i];
             assert!(z >= b - 1e-5, "GPU erosion breached bedrock! Z: {}, Bedrock: {}", z, b);
         }
+    }
+
+    #[test]
+    fn test_wgpu_beach_waves_scenario() {
+        use sim_core::Scenarios;
+
+        let desc = SimDomainDescriptor {
+            grid_res_x: 64,
+            grid_res_y: 64,
+            extent_x: 50.0,
+            extent_y: 50.0,
+            ..Default::default()
+        };
+
+        let grid = Scenarios::beach_sandcastle_waves(desc);
+        let mut sim: Box<dyn SimulationBackend> = Box::new(WgpuSimulator::new_sync(grid));
+
+        // Step simulation on GPU for 40 steps (0.4s of physical time with wave surge)
+        for _ in 0..40 {
+            sim.step(0.01);
+        }
+
+        sim.sync_to_cpu();
+        let state = sim.current_state();
+
+        // 1. Verify positivity and no NaNs across all cells
+        for (i, &h) in state.h.iter().enumerate() {
+            assert!(h >= 0.0, "GPU wave fluid depth negative at {}: {}", i, h);
+            assert!(!h.is_nan(), "GPU wave fluid depth NaN at {}", i);
+            let z = state.z_bed[i];
+            let b = state.bedrock_z[i];
+            assert!(z >= b - 1e-4, "GPU bed below bedrock at {}: z={}, b={}", i, z, b);
+            assert!(!z.is_nan(), "GPU bed elevation NaN at {}", i);
+        }
+
+        // 2. Verify wave has surged onshore into South cells
+        let swash_idx = state.idx(32, 50); // row 50 is near the coastline
+        assert!(
+            state.h[swash_idx] > 0.01,
+            "GPU wave failed to lap onto beach at row 50! Depth: {}",
+            state.h[swash_idx]
+        );
     }
 }

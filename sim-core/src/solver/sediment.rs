@@ -60,7 +60,7 @@ pub fn step_saturation(grid: &mut DoubleBufferedGrid, dt: f32) {
     let width = grid.descriptor.grid_res_x;
     let height = grid.descriptor.grid_res_y;
 
-    grid.current.apply_reflective_boundaries();
+    grid.apply_boundaries();
 
     let drying_rate = 0.02f32; // Moisture drying per second
     let diffusion_rate = 0.05f32; // Soil moisture capillary diffusion
@@ -96,7 +96,7 @@ pub fn step_saturation(grid: &mut DoubleBufferedGrid, dt: f32) {
         }
     }
 
-    grid.next.apply_reflective_boundaries();
+    grid.next.apply_boundaries(&grid.boundaries, grid.time);
     grid.swap();
 }
 
@@ -192,7 +192,7 @@ pub fn step_exner_exchange(grid: &mut DoubleBufferedGrid, dt: f32, params: &Sedi
         }
     }
 
-    grid.next.apply_reflective_boundaries();
+    grid.next.apply_boundaries(&grid.boundaries, grid.time);
     grid.swap();
 }
 
@@ -211,7 +211,7 @@ pub fn step_talus_collapse(grid: &mut DoubleBufferedGrid, params: &SedimentParam
     let tan_damp = params.phi_damp.tan();
     let tan_sat = params.phi_sat.tan();
 
-    grid.current.apply_reflective_boundaries();
+    grid.apply_boundaries();
 
     // 8-neighbor offsets and distances
     let sqrt2 = std::f32::consts::SQRT_2;
@@ -301,6 +301,6 @@ pub fn step_talus_collapse(grid: &mut DoubleBufferedGrid, params: &SedimentParam
         }
     }
 
-    grid.next.apply_reflective_boundaries();
+    grid.next.apply_boundaries(&grid.boundaries, grid.time);
     grid.swap();
 }

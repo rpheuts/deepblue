@@ -1,3 +1,4 @@
+use crate::boundary::{DomainBoundaryConfig, EdgeBoundary};
 use crate::domain::SimDomainDescriptor;
 use crate::state::DoubleBufferedGrid;
 
@@ -156,6 +157,138 @@ impl Scenarios {
         }
 
         grid.apply_reflective_boundaries();
+        grid
+    }
+
+    /// Creates a coastal beach scenario with incoming ocean swell/waves,
+    /// a pre-built sandcastle with ramparts, corner towers, and moat in the swash zone,
+    /// and a non-erodible stone breakwater / jetty demonstrating wave reflection and flow diversion.
+    pub fn beach_sandcastle_waves(desc: SimDomainDescriptor) -> DoubleBufferedGrid {
+        let mut grid = DoubleBufferedGrid::new(desc);
+        let width = desc.grid_res_x;
+        let height = desc.grid_res_y;
+
+        let wave_gen = EdgeBoundary::WaveGenerator {
+            base_elevation: 0.12,
+            wave_amplitude: 0.38,
+            wave_period: 15.0,
+            surge_speed: 0.65,
+            tide_amplitude: 0.12,
+            tide_period: 90.0,
+        };
+        grid.boundaries = DomainBoundaryConfig::coastal_waves(wave_gen);
+
+        let pi = std::f32::consts::PI;
+
+        // Sandcastle center and size
+        let castle_cx = 0.50f32;
+        let castle_cy = 0.54f32;
+        let castle_hw = 0.085f32; // half-width in normalized units (~8.5 meters)
+
+        for y in 0..height {
+            let ny = y as f32 / height as f32; // 0.0 (North/dunes) to 1.0 (South/ocean)
+
+            for x in 0..width {
+                let nx = x as f32 / width as f32; // 0.0 (West) to 1.0 (East)
+                let idx = grid.current.idx(x, y);
+
+                // --- 1. Base Coastline Bathymetry & Elevation ---
+                // North (ny < 0.40): Dunes & backshore (z = 0.6m to 1.8m)
+                // Middle (ny in 0.40..0.72): Intertidal swash zone (z = 0.0m to 0.6m)
+                // South (ny > 0.72): Offshore seabed (z = -0.55m to 0.0m)
+                let mut z = if ny < 0.40 {
+                    let dune_progress = (0.40 - ny) / 0.40;
+                    0.60 + 1.20 * dune_progress.powf(1.2) + 0.08 * (nx * 6.0 * pi).sin() * (ny * 8.0 * pi).cos()
+                } else if ny < 0.72 {
+                    let beach_progress = (0.72 - ny) / 0.32;
+                    beach_progress * 0.60 + 0.03 * (nx * 12.0 * pi).sin()
+                } else {
+                    let deep_progress = (ny - 0.72) / 0.28;
+                    -0.55 * deep_progress.powf(0.85) + 0.02 * (nx * 8.0 * pi).cos()
+                };
+
+                // Default bedrock: 0.45m below ground level in dunes/beach, or deep in seabed
+                let mut bedrock = (z - 0.45).max(-1.0);
+
+                // --- 2. Pre-Built Stone Breakwater / Jetty (West Flank) ---
+                // Extends from ny = 0.38 down to ny = 0.75, width ~ 3.5 meters
+                let jetty_x = 0.22f32;
+                let jetty_half_w = 0.018f32;
+                if (nx - jetty_x).abs() <= jetty_half_w && (0.38..=0.75).contains(&ny) {
+                    // Indestructible stone breakwater / groyne
+                    let stone_height = 1.15f32;
+                    z = z.max(stone_height);
+                    bedrock = z; // bedrock == z_bed makes it indestructible stone!
+                }
+
+                // --- 3. Pre-Built Erodible Sandcastle (Center Swash Zone) ---
+                let dx_c = (nx - castle_cx).abs();
+                let dy_c = (ny - castle_cy).abs();
+                let d_box = dx_c.max(dy_c);
+
+                if d_box < castle_hw + 0.035 {
+                    let base_beach_z = z;
+                    // Keep bedrock below original beach level so all sandcastle features are erodible sand
+                    bedrock = (base_beach_z - 0.25).max(-0.1);
+
+                    // A. Moat: excavated ring surrounding the ramparts
+                    if d_box >= castle_hw - 0.008 && d_box <= castle_hw + 0.024 {
+                        let moat_depth = 0.22f32;
+                        z = (base_beach_z - moat_depth).max(bedrock + 0.02);
+                    }
+                    // B. Outer Curtain Ramparts: sand embankment
+                    else if d_box >= castle_hw - 0.032 && d_box < castle_hw - 0.008 {
+                        let wall_h = 0.55f32;
+                        z = base_beach_z + wall_h;
+                    }
+                    // C. Inner Courtyard & Central Keep
+                    else if d_box < castle_hw - 0.032 {
+                        let dist_center = (dx_c * dx_c + dy_c * dy_c).sqrt();
+                        if dist_center < 0.022 {
+                            // Central Keep Tower
+                            z = base_beach_z + 0.85f32;
+                        } else {
+                            // Courtyard platform
+                            z = base_beach_z + 0.22f32;
+                        }
+                    }
+
+                    // D. Four Corner Bastion Towers
+                    let corner_dist = ((dx_c - (castle_hw - 0.02)).powi(2) + (dy_c - (castle_hw - 0.02)).powi(2)).sqrt();
+                    if corner_dist < 0.020 {
+                        let tower_h = 0.75f32;
+                        z = z.max(base_beach_z + tower_h);
+                    }
+                }
+
+                grid.current.z_bed[idx] = z;
+                grid.next.z_bed[idx] = z;
+                grid.current.bedrock_z[idx] = bedrock;
+                grid.next.bedrock_z[idx] = bedrock;
+
+                // --- 4. Initial Water Level ---
+                // Pre-fill ocean (still water level at eta = 0.12m)
+                let still_water_eta = 0.12f32;
+                if still_water_eta > z {
+                    let h = still_water_eta - z;
+                    grid.current.h[idx] = h;
+                    grid.next.h[idx] = h;
+                    grid.current.soil_sat[idx] = 1.0;
+                    grid.next.soil_sat[idx] = 1.0;
+                } else {
+                    // Damp sand in swash zone, dry on upper dunes
+                    let sat = if ny > 0.48 {
+                        0.55 * ((ny - 0.48) / 0.24).clamp(0.0, 1.0)
+                    } else {
+                        0.05
+                    };
+                    grid.current.soil_sat[idx] = sat;
+                    grid.next.soil_sat[idx] = sat;
+                }
+            }
+        }
+
+        grid.apply_boundaries();
         grid
     }
 }

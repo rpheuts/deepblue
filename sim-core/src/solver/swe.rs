@@ -72,7 +72,7 @@ pub fn step_swe_with_params(grid: &mut DoubleBufferedGrid, dt: f32, params: &Swe
     let manning_n = params.manning_n;
 
     // Ensure ghost cells on the current buffer are up to date before computing interface fluxes
-    grid.current.apply_reflective_boundaries();
+    grid.apply_boundaries();
 
     // Helper for local wave speed with protection against negative depths
     let wave_speed = |h: f32, v: f32| -> f32 {
@@ -275,8 +275,11 @@ pub fn step_swe_with_params(grid: &mut DoubleBufferedGrid, dt: f32, params: &Swe
         }
     }
 
-    // Apply reflective boundary conditions to the new state
-    grid.next.apply_reflective_boundaries();
+    // Advance simulation time
+    grid.time += dt;
+
+    // Apply domain boundary conditions to the new state
+    grid.next.apply_boundaries(&grid.boundaries, grid.time);
 
     // Swap buffers for next tick
     grid.swap();

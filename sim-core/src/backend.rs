@@ -71,6 +71,15 @@ pub trait SimulationBackend {
     /// Evaluates the Courant-Friedrichs-Lewy (CFL) condition across the active domain
     /// and returns the maximum allowable stable time step.
     fn compute_max_stable_dt(&self, cfl: f32) -> f32;
+
+    /// Returns the current boundary configuration.
+    fn boundaries(&self) -> &crate::boundary::DomainBoundaryConfig;
+
+    /// Updates the boundary configuration.
+    fn set_boundaries(&mut self, boundaries: crate::boundary::DomainBoundaryConfig);
+
+    /// Returns the total elapsed physical simulation time (in seconds).
+    fn sim_time(&self) -> f32;
 }
 
 /// Headless reference CPU simulation backend.
@@ -87,7 +96,7 @@ pub struct CpuSimulator {
 impl CpuSimulator {
     /// Creates a new CPU simulator with default physical parameters.
     pub fn new(mut grid: DoubleBufferedGrid) -> Self {
-        grid.apply_reflective_boundaries();
+        grid.apply_boundaries();
         Self {
             grid,
             swe_params: SweParams::default(),
@@ -98,7 +107,7 @@ impl CpuSimulator {
 
     /// Creates a new CPU simulator with custom SWE physical parameters.
     pub fn with_params(mut grid: DoubleBufferedGrid, swe_params: SweParams) -> Self {
-        grid.apply_reflective_boundaries();
+        grid.apply_boundaries();
         Self {
             grid,
             swe_params,
@@ -113,7 +122,7 @@ impl CpuSimulator {
         swe_params: SweParams,
         sediment_params: crate::solver::sediment::SedimentParams,
     ) -> Self {
-        grid.apply_reflective_boundaries();
+        grid.apply_boundaries();
         Self {
             grid,
             swe_params,
@@ -156,7 +165,7 @@ impl SimulationBackend for CpuSimulator {
     }
 
     fn upload_state(&mut self) {
-        self.grid.apply_reflective_boundaries();
+        self.grid.apply_boundaries();
     }
 
     fn upload_water_depth(&mut self) {
@@ -167,5 +176,17 @@ impl SimulationBackend for CpuSimulator {
         let dx = self.grid.descriptor.extent_x / self.grid.descriptor.grid_res_x as f32;
         let dy = self.grid.descriptor.extent_y / self.grid.descriptor.grid_res_y as f32;
         compute_max_stable_dt(&self.grid.current, dx, dy, cfl, self.swe_params.gravity)
+    }
+
+    fn boundaries(&self) -> &crate::boundary::DomainBoundaryConfig {
+        &self.grid.boundaries
+    }
+
+    fn set_boundaries(&mut self, boundaries: crate::boundary::DomainBoundaryConfig) {
+        self.grid.boundaries = boundaries;
+    }
+
+    fn sim_time(&self) -> f32 {
+        self.grid.time
     }
 }

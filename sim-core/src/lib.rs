@@ -1,10 +1,12 @@
 pub mod domain;
 pub mod state;
+pub mod boundary;
 pub mod solver;
 pub mod backend;
 pub mod scenario;
 
 pub use backend::{SimulationBackend, CpuSimulator};
+pub use boundary::{EdgeBoundary, DomainBoundaryConfig};
 pub use scenario::Scenarios;
 
 #[cfg(test)]
@@ -446,6 +448,116 @@ mod tests {
             damp_peak,
             sat_peak
         );
+    }
+
+    #[test]
+    fn test_wave_generator_boundary() {
+        use crate::boundary::{EdgeBoundary, DomainBoundaryConfig};
+
+        let desc = SimDomainDescriptor {
+            grid_res_x: 20,
+            grid_res_y: 20,
+            extent_x: 20.0,
+            extent_y: 20.0,
+            ..Default::default()
+        };
+        let mut grid = DoubleBufferedGrid::new(desc);
+        let wave_gen = EdgeBoundary::WaveGenerator {
+            base_elevation: 1.0,
+            wave_amplitude: 0.5,
+            wave_period: 4.0,
+            surge_speed: 1.5,
+            tide_amplitude: 0.0,
+            tide_period: 60.0,
+        };
+        grid.boundaries = DomainBoundaryConfig {
+            south: wave_gen,
+            ..Default::default()
+        };
+
+        // Flat beach bathymetry at z = 0.5
+        for i in 0..grid.current.z_bed.len() {
+            grid.current.z_bed[i] = 0.5;
+            grid.current.bedrock_z[i] = 0.0;
+        }
+
+        // At t = 0.8s with wave_period = 4.0s:
+        // phase = 0.8 / 4.0 = 0.20
+        // s = 0.20 / 0.40 = 0.50 -> sin(0.5 * pi) = 1.0 (peak crest!)
+        // target_eta = 1.0 + 0.5 * 1.0 = 1.5
+        // target_h = 1.5 - 0.5 = 1.0
+        // normal_velocity = 1.5 m/s onshore (pushing North, so v = -1.5)
+        grid.time = 0.8;
+        grid.apply_boundaries();
+
+        let south_ghost_idx = grid.current.idx(10, 19);
+        assert!(
+            (grid.current.h[south_ghost_idx] - 1.0).abs() < 1e-3,
+            "Wave crest depth expected ~1.0m, got: {}",
+            grid.current.h[south_ghost_idx]
+        );
+        assert!(
+            (grid.current.v[south_ghost_idx] - (-1.5)).abs() < 1e-3,
+            "Wave surge velocity expected -1.5 m/s, got: {}",
+            grid.current.v[south_ghost_idx]
+        );
+
+        // Step simulation forward with SWE (25 steps of 0.02s = 0.5s)
+        for _ in 0..25 {
+            step_swe(&mut grid, 0.02);
+        }
+
+        // Water should have propagated inland from the South edge into row 18 and 17
+        let row18_idx = grid.current.idx(10, 18);
+        assert!(
+            grid.current.h[row18_idx] > 0.05,
+            "Wave surge did not propagate into row 18! Depth: {}",
+            grid.current.h[row18_idx]
+        );
+        let row17_idx = grid.current.idx(10, 17);
+        assert!(
+            grid.current.h[row17_idx] > 0.02,
+            "Wave surge did not propagate into row 17! Depth: {}",
+            grid.current.h[row17_idx]
+        );
+    }
+
+    #[test]
+    fn test_beach_sandcastle_waves_simulation() {
+        use crate::Scenarios;
+        use crate::backend::{CpuSimulator, SimulationBackend};
+
+        let desc = SimDomainDescriptor {
+            grid_res_x: 64,
+            grid_res_y: 64,
+            extent_x: 50.0,
+            extent_y: 50.0,
+            ..Default::default()
+        };
+
+        let grid = Scenarios::beach_sandcastle_waves(desc);
+        let mut sim = CpuSimulator::new(grid);
+
+        // Verify initial state
+        assert!(sim.sim_time() == 0.0);
+        let state = sim.current_state();
+        let center_idx = state.idx(32, 34); // Center of sandcastle
+        assert!(state.z_bed[center_idx] > 0.5, "Sandcastle elevation should be > 0.5m");
+
+        // Simulate 40 steps
+        for _ in 0..40 {
+            sim.step(0.01);
+        }
+
+        // Verify sanity after wave steps
+        let post_state = sim.current_state();
+        for (i, &h) in post_state.h.iter().enumerate() {
+            assert!(h >= 0.0, "Fluid depth negative at index {}: {}", i, h);
+            assert!(!h.is_nan(), "Fluid depth NaN at index {}", i);
+            let z = post_state.z_bed[i];
+            let b = post_state.bedrock_z[i];
+            assert!(z >= b - 1e-4, "Bed elevation below bedrock at index {}: z={}, b={}", i, z, b);
+        }
     }
 }
 
