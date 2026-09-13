@@ -1,6 +1,6 @@
 use macroquad::prelude::*;
 use sim_core::domain::SimDomainDescriptor;
-use sim_core::state::DoubleBufferedGrid;
+use sim_core::state::{DoubleBufferedGrid, GridState};
 use sim_core::backend::{SimulationBackend, CpuSimulator};
 use sim_core::Scenarios;
 use sim_backend::WgpuSimulator;
@@ -10,6 +10,95 @@ enum ActivePreset {
     BeachStream,
     DamBreak,
     LakeAtRest,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum FlowVisMode {
+    Both,
+    Vectors,
+    Particles,
+    Off,
+}
+
+impl FlowVisMode {
+    fn next(self) -> Self {
+        match self {
+            Self::Both => Self::Vectors,
+            Self::Vectors => Self::Particles,
+            Self::Particles => Self::Off,
+            Self::Off => Self::Both,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Both => "Flow Lines & Particles",
+            Self::Vectors => "Flow Lines (Vectors)",
+            Self::Particles => "Particles (Tracers)",
+            Self::Off => "Off",
+        }
+    }
+}
+
+struct FlowParticle {
+    x: f32,
+    y: f32,
+    prev_x: f32,
+    prev_y: f32,
+    life: f32,
+    max_life: f32,
+    speed: f32,
+}
+
+struct FastRng(u32);
+impl FastRng {
+    fn new(seed: u32) -> Self {
+        Self(seed.max(1))
+    }
+    fn next_u32(&mut self) -> u32 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 17;
+        self.0 ^= self.0 << 5;
+        self.0
+    }
+    fn next_f32(&mut self) -> f32 {
+        (self.next_u32() & 0x00FF_FFFF) as f32 / 16777216.0
+    }
+    fn range_f32(&mut self, min: f32, max: f32) -> f32 {
+        min + (max - min) * self.next_f32()
+    }
+}
+
+fn respawn_particle(
+    p: &mut FlowParticle,
+    state: &GridState,
+    rng: &mut FastRng,
+    width: u32,
+    height: u32,
+) {
+    p.life = rng.range_f32(1.0, 3.5);
+    p.max_life = p.life;
+    p.speed = 0.0;
+
+    // Sample randomly to find active flowing water
+    for _ in 0..14 {
+        let gx = rng.range_f32(2.0, (width - 3) as f32) as u32;
+        let gy = rng.range_f32(2.0, (height - 3) as f32) as u32;
+        let idx = state.idx(gx, gy);
+        if state.h[idx] > 0.03 {
+            p.x = gx as f32 + rng.next_f32();
+            p.y = gy as f32 + rng.next_f32();
+            p.prev_x = p.x;
+            p.prev_y = p.y;
+            return;
+        }
+    }
+
+    // Fallback: spawn near upper river inlet
+    p.x = width as f32 * 0.5 + rng.range_f32(-10.0, 10.0);
+    p.y = height as f32 * 0.08 + rng.range_f32(0.0, 15.0);
+    p.prev_x = p.x;
+    p.prev_y = p.y;
 }
 
 #[macroquad::main("DeepBlue Hydraulic Sandbox")]
@@ -31,11 +120,31 @@ async fn main() {
     let mut is_inflow_active = true;
     let mut is_paused = false;
     let mut current_preset = ActivePreset::BeachStream;
+    let mut flow_vis_mode = FlowVisMode::Both;
 
     // Fast texture blitting buffer
     let mut img = Image::gen_image_color(desc.grid_res_x as u16, desc.grid_res_y as u16, BLACK);
     let texture = Texture2D::from_image(&img);
     texture.set_filter(FilterMode::Linear);
+
+    // Flow tracer particles
+    const PARTICLE_COUNT: usize = 1400;
+    let mut rng = FastRng::new(0x9E37_79B9);
+    let mut particles: Vec<FlowParticle> = (0..PARTICLE_COUNT)
+        .map(|_| {
+            let mut p = FlowParticle {
+                x: 0.0,
+                y: 0.0,
+                prev_x: 0.0,
+                prev_y: 0.0,
+                life: 0.0,
+                max_life: 1.0,
+                speed: 0.0,
+            };
+            respawn_particle(&mut p, sim.current_state(), &mut rng, desc.grid_res_x, desc.grid_res_y);
+            p
+        })
+        .collect();
 
     loop {
         // --- 1. Scenario Presets ---
@@ -46,6 +155,9 @@ async fn main() {
             } else {
                 Box::new(CpuSimulator::new(grid))
             };
+            for p in &mut particles {
+                respawn_particle(p, sim.current_state(), &mut rng, desc.grid_res_x, desc.grid_res_y);
+            }
             is_inflow_active = true;
             current_preset = ActivePreset::BeachStream;
         } else if is_key_pressed(KeyCode::Key2) {
@@ -55,6 +167,9 @@ async fn main() {
             } else {
                 Box::new(CpuSimulator::new(grid))
             };
+            for p in &mut particles {
+                respawn_particle(p, sim.current_state(), &mut rng, desc.grid_res_x, desc.grid_res_y);
+            }
             is_inflow_active = false;
             current_preset = ActivePreset::DamBreak;
         } else if is_key_pressed(KeyCode::Key3) {
@@ -64,6 +179,9 @@ async fn main() {
             } else {
                 Box::new(CpuSimulator::new(grid))
             };
+            for p in &mut particles {
+                respawn_particle(p, sim.current_state(), &mut rng, desc.grid_res_x, desc.grid_res_y);
+            }
             is_inflow_active = false;
             current_preset = ActivePreset::LakeAtRest;
         } else if is_key_pressed(KeyCode::R) {
@@ -78,6 +196,9 @@ async fn main() {
             } else {
                 Box::new(CpuSimulator::new(grid))
             };
+            for p in &mut particles {
+                respawn_particle(p, sim.current_state(), &mut rng, desc.grid_res_x, desc.grid_res_y);
+            }
         }
 
         // --- 2. Toggles ---
@@ -96,6 +217,10 @@ async fn main() {
                 sim = Box::new(WgpuSimulator::new(current_grid).await);
                 is_gpu = true;
             }
+        }
+
+        if is_key_pressed(KeyCode::V) {
+            flow_vis_mode = flow_vis_mode.next();
         }
 
         if is_key_pressed(KeyCode::I) {
@@ -236,30 +361,36 @@ async fn main() {
                 let b_land = (tb * shade * moisture_darkening).clamp(0.0, 255.0);
 
                 if depth > 0.005 {
-                    // Water depth tint: shallow turquoise -> deep cobalt
-                    let (wr, wg, wb) = if depth < 0.15 {
-                        (65.0, 195.0, 220.0)
-                    } else if depth < 0.9 {
-                        (30.0, 135.0, 215.0)
+                    // Distinct water depth gradient:
+                    // Shallow: clear, translucent turquoise (depth of riverbed clearly visible through it!)
+                    // Mid: rich tropical cyan/azure
+                    // Deep: deep ocean navy
+                    let (wr, wg, wb) = if depth < 0.12 {
+                        (40.0, 175.0, 205.0)
+                    } else if depth < 0.60 {
+                        (25.0, 110.0, 195.0)
                     } else {
-                        (15.0, 60.0, 165.0)
+                        (10.0, 45.0, 140.0)
                     };
 
                     // Suspended sediment tinting: muddy silty river brown where erosion occurs
                     let c = state.sediment_c[idx].clamp(0.0, 0.5);
-                    let turbidity = (c / 0.10).clamp(0.0, 1.0);
-                    let (mud_r, mud_g, mud_b) = (175.0, 125.0, 70.0);
+                    let turbidity = (c / 0.08).clamp(0.0, 1.0);
+                    let (mud_r, mud_g, mud_b) = (165.0, 115.0, 65.0);
                     let base_water_r = wr * (1.0 - turbidity) + mud_r * turbidity;
                     let base_water_g = wg * (1.0 - turbidity) + mud_g * turbidity;
                     let base_water_b = wb * (1.0 - turbidity) + mud_b * turbidity;
 
-                    // Whitewater rapids foam based on fluid velocity
+                    // Rapids foam: ONLY appears in violent rapids or plunge pools (> 2.8 m/s),
+                    // capped at 45% max opacity so it never completely washes out the water color.
+                    // Normal river flow velocity (0.5 - 2.5 m/s) has foam = 0.0!
                     let u = state.u[idx];
                     let v = state.v[idx];
                     let speed = (u * u + v * v).sqrt();
-                    let foam = (speed / 3.2).clamp(0.0, 1.0);
+                    let foam = ((speed - 2.8).max(0.0) / 3.0).clamp(0.0, 0.45);
 
-                    let water_alpha = (depth / 0.75).clamp(0.42, 0.92);
+                    // Water transparency: shallow water is translucent (alpha ~ 0.38) so the riverbed shows through cleanly
+                    let water_alpha = (depth / 0.80).clamp(0.38, 0.92);
                     let final_wr = base_water_r * (1.0 - foam) + 245.0 * foam;
                     let final_wg = base_water_g * (1.0 - foam) + 250.0 * foam;
                     let final_wb = base_water_b * (1.0 - foam) + 255.0 * foam;
@@ -290,14 +421,97 @@ async fn main() {
             },
         );
 
-        // --- 7. HUD Telemetry & Control Overlays ---
+        // --- 7. Flow Visualization (Streamlines & Tracer Particles) ---
+        let screen_w = screen_width();
+        let screen_h = screen_height();
+        let frame_dt = get_frame_time().min(0.05);
+
+        // Mode: Flow Lines (Grid Vectors)
+        if flow_vis_mode == FlowVisMode::Both || flow_vis_mode == FlowVisMode::Vectors {
+            let step: usize = 16;
+            for gy in (step / 2..desc.grid_res_y as usize).step_by(step) {
+                for gx in (step / 2..desc.grid_res_x as usize).step_by(step) {
+                    let idx = state.idx(gx as u32, gy as u32);
+                    let depth = state.h[idx];
+                    if depth > 0.02 {
+                        let u = state.u[idx];
+                        let v = state.v[idx];
+                        let speed = (u * u + v * v).sqrt();
+                        if speed > 0.05 {
+                            let sx = (gx as f32 + 0.5) / desc.grid_res_x as f32 * screen_w;
+                            let sy = (gy as f32 + 0.5) / desc.grid_res_y as f32 * screen_h;
+                            let dir_x = u / speed;
+                            let dir_y = v / speed;
+                            // Flow line length scales directly with fluid speed (longer for faster water!)
+                            let len = (speed * 12.0).clamp(4.0, 24.0);
+                            let ex = sx + dir_x * len;
+                            let ey = sy + dir_y * len;
+                            let alpha = (speed / 1.5).clamp(0.30, 0.85);
+
+                            draw_line(sx, sy, ex, ey, 1.6, Color::new(0.70, 0.92, 1.0, alpha));
+                            draw_circle(ex, ey, 1.4, Color::new(1.0, 1.0, 1.0, alpha * 0.95));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Mode: Dynamic Tracer Particles
+        if flow_vis_mode == FlowVisMode::Both || flow_vis_mode == FlowVisMode::Particles {
+            for p in particles.iter_mut() {
+                if !is_paused {
+                    p.prev_x = p.x;
+                    p.prev_y = p.y;
+
+                    let gx = p.x.clamp(1.0, (desc.grid_res_x - 2) as f32) as u32;
+                    let gy = p.y.clamp(1.0, (desc.grid_res_y - 2) as f32) as u32;
+                    let idx = state.idx(gx, gy);
+                    let depth = state.h[idx];
+                    let u = state.u[idx];
+                    let v = state.v[idx];
+                    let speed = (u * u + v * v).sqrt();
+                    p.speed = speed;
+
+                    p.life -= frame_dt;
+                    if p.life <= 0.0
+                        || depth < 0.02
+                        || p.x < 2.0
+                        || p.x >= (desc.grid_res_x - 2) as f32
+                        || p.y < 2.0
+                        || p.y >= (desc.grid_res_y - 2) as f32
+                    {
+                        respawn_particle(p, state, &mut rng, desc.grid_res_x, desc.grid_res_y);
+                    } else {
+                        // Advect with velocity field
+                        p.x += u * 32.0 * frame_dt;
+                        p.y += v * 32.0 * frame_dt;
+                    }
+                }
+
+                let sx0 = p.prev_x / desc.grid_res_x as f32 * screen_w;
+                let sy0 = p.prev_y / desc.grid_res_y as f32 * screen_h;
+                let sx1 = p.x / desc.grid_res_x as f32 * screen_w;
+                let sy1 = p.y / desc.grid_res_y as f32 * screen_h;
+
+                let dist_sq = (sx1 - sx0).powi(2) + (sy1 - sy0).powi(2);
+                if dist_sq < 60.0 * 60.0 {
+                    let life_alpha = (p.life / p.max_life).clamp(0.0, 1.0);
+                    let speed_alpha = (p.speed / 1.0).clamp(0.25, 0.95);
+                    let alpha = life_alpha * speed_alpha;
+                    draw_line(sx0, sy0, sx1, sy1, 1.8, Color::new(0.88, 0.96, 1.0, alpha));
+                    draw_circle(sx1, sy1, 1.3, Color::new(1.0, 1.0, 1.0, alpha));
+                }
+            }
+        }
+
+        // --- 8. HUD Telemetry & Control Overlays ---
         let safe_dt = sim.compute_max_stable_dt(0.5);
         let fluid_mass = sim.total_fluid_mass();
         let sed_mass = sim.total_sediment_mass();
         let max_c = state.sediment_c.iter().copied().fold(0.0f32, f32::max);
 
         // Top bar
-        draw_rectangle(8.0, 8.0, 520.0, 118.0, Color::new(0.0, 0.0, 0.0, 0.78));
+        draw_rectangle(8.0, 8.0, 540.0, 134.0, Color::new(0.0, 0.0, 0.0, 0.80));
 
         draw_text(
             format!("FPS: {} | Backend: {}", get_fps(), sim.backend_name()),
@@ -344,13 +558,24 @@ async fn main() {
 
         draw_text(
             format!(
+                "Flow Vis: {} ([V] cycle)",
+                flow_vis_mode.label()
+            ),
+            16.0,
+            104.0,
+            14.0,
+            GOLD,
+        );
+
+        draw_text(
+            format!(
                 "Fluid: {:.0} m³ | Solid Sed: {:.0} m³ | Max C: {:.1}%",
                 fluid_mass,
                 sed_mass,
                 max_c * 100.0
             ),
             16.0,
-            104.0,
+            120.0,
             14.0,
             SKYBLUE,
         );
@@ -358,8 +583,8 @@ async fn main() {
         draw_text(
             format!("CFL Max dt: {:.4}s | Sub-step dt: {:.4}s", safe_dt, current_sub_dt),
             16.0,
-            120.0,
-            13.0,
+            136.0,
+            12.0,
             DARKGRAY,
         );
 
