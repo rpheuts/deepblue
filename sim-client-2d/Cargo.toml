@@ -8,3 +8,4 @@ sim-core = { path = "../sim-core" }
 sim-backend = { path = "../sim-backend" }
 macroquad = "0.4"
 pollster = "0.3"
+rayon = "1.10"

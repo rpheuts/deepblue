@@ -20,11 +20,13 @@ pub trait SimulationBackend {
     /// Advances the simulation over a duration of `total_dt` by subdividing into
     /// stable sub-steps of at most `max_sub_dt`.
     fn step_subdivided(&mut self, total_dt: f32, max_sub_dt: f32) {
-        let mut remaining = total_dt;
-        while remaining > 1e-6 {
-            let dt = remaining.min(max_sub_dt);
+        if total_dt <= 1e-6 {
+            return;
+        }
+        let steps = (total_dt / max_sub_dt).ceil().max(1.0) as usize;
+        let dt = total_dt / steps as f32;
+        for _ in 0..steps {
             self.step(dt);
-            remaining -= dt;
         }
     }
 
@@ -47,6 +49,14 @@ pub trait SimulationBackend {
     /// Uploads modified host CPU grid state to device compute buffers.
     /// For CPU-based backends, this reapplies boundary conditions.
     fn upload_state(&mut self);
+
+    /// Uploads only fluid depth modifications (`h`) to device compute buffers.
+    ///
+    /// For continuous sources, rain, or tidal boundaries where bed elevation and velocity
+    /// are not altered by the host, this avoids re-uploading all storage buffers across the bus.
+    fn upload_water_depth(&mut self) {
+        self.upload_state();
+    }
 
     /// Calculates the total fluid mass in the active physical domain.
     fn total_fluid_mass(&self) -> f32 {
@@ -147,6 +157,10 @@ impl SimulationBackend for CpuSimulator {
 
     fn upload_state(&mut self) {
         self.grid.apply_reflective_boundaries();
+    }
+
+    fn upload_water_depth(&mut self) {
+        // No-op for CPU backend: memory is already updated directly in current.h
     }
 
     fn compute_max_stable_dt(&self, cfl: f32) -> f32 {

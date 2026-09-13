@@ -1,4 +1,5 @@
 use macroquad::prelude::*;
+use rayon::prelude::*;
 use sim_core::domain::SimDomainDescriptor;
 use sim_core::state::{DoubleBufferedGrid, GridState};
 use sim_core::backend::{SimulationBackend, CpuSimulator};
@@ -101,6 +102,27 @@ fn respawn_particle(
     p.prev_y = p.y;
 }
 
+/// Directional 3D hillshading pass executed in parallel across grid rows.
+fn compute_hillshade_parallel(z_bed: &[f32], shade_cache: &mut [f32], width: usize, height: usize) {
+    shade_cache
+        .par_chunks_exact_mut(width)
+        .enumerate()
+        .for_each(|(y, row)| {
+            let y_prev_offset = if y > 0 { (y - 1) * width } else { y * width };
+            let y_next_offset = if y < height - 1 { (y + 1) * width } else { y * width };
+            let y_curr_offset = y * width;
+
+            for x in 0..width {
+                let x_prev = if x > 0 { x - 1 } else { x };
+                let x_next = if x < width - 1 { x + 1 } else { x };
+
+                let dz_x = (z_bed[y_curr_offset + x_next] - z_bed[y_curr_offset + x_prev]) * 0.5;
+                let dz_y = (z_bed[y_next_offset + x] - z_bed[y_prev_offset + x]) * 0.5;
+                row[x] = (1.0 - 0.28 * (dz_x + dz_y)).clamp(0.60, 1.40);
+            }
+        });
+}
+
 #[macroquad::main("DeepBlue Hydraulic Sandbox")]
 async fn main() {
     let desc = SimDomainDescriptor {
@@ -127,8 +149,17 @@ async fn main() {
     let texture = Texture2D::from_image(&img);
     texture.set_filter(FilterMode::Linear);
 
-    // Flow tracer particles
-    const PARTICLE_COUNT: usize = 1400;
+    // Cached hillshade and telemetry buffers to eliminate single-core CPU stalls
+    let mut shade_cache = vec![1.0f32; (desc.grid_res_x * desc.grid_res_y) as usize];
+    let mut bed_dirty = true;
+    let mut frame_count: u64 = 0;
+    let mut cached_fluid_mass = sim.total_fluid_mass();
+    let mut cached_sed_mass = sim.total_sediment_mass();
+    let mut cached_max_c = 0.0f32;
+    let mut safe_dt = 0.004f32;
+
+    // Flow tracer particles (tuned for smooth high-frame-rate rendering)
+    const PARTICLE_COUNT: usize = 900;
     let mut rng = FastRng::new(0x9E37_79B9);
     let mut particles: Vec<FlowParticle> = (0..PARTICLE_COUNT)
         .map(|_| {
@@ -160,6 +191,7 @@ async fn main() {
             }
             is_inflow_active = true;
             current_preset = ActivePreset::BeachStream;
+            bed_dirty = true;
         } else if is_key_pressed(KeyCode::Key2) {
             let grid = Scenarios::dam_break(desc);
             sim = if is_gpu {
@@ -172,6 +204,7 @@ async fn main() {
             }
             is_inflow_active = false;
             current_preset = ActivePreset::DamBreak;
+            bed_dirty = true;
         } else if is_key_pressed(KeyCode::Key3) {
             let grid = Scenarios::lake_at_rest(desc);
             sim = if is_gpu {
@@ -184,6 +217,7 @@ async fn main() {
             }
             is_inflow_active = false;
             current_preset = ActivePreset::LakeAtRest;
+            bed_dirty = true;
         } else if is_key_pressed(KeyCode::R) {
             // Reset current preset
             let grid = match current_preset {
@@ -199,6 +233,7 @@ async fn main() {
             for p in &mut particles {
                 respawn_particle(p, sim.current_state(), &mut rng, desc.grid_res_x, desc.grid_res_y);
             }
+            bed_dirty = true;
         }
 
         // --- 2. Toggles ---
@@ -217,6 +252,7 @@ async fn main() {
                 sim = Box::new(WgpuSimulator::new(current_grid).await);
                 is_gpu = true;
             }
+            bed_dirty = true;
         }
 
         if is_key_pressed(KeyCode::V) {
@@ -271,7 +307,12 @@ async fn main() {
                         }
                     }
                 }
-                sim.upload_state();
+                if add_water && !build_dam && !dig_trench && !dump_sand {
+                    sim.upload_water_depth();
+                } else {
+                    sim.upload_state();
+                    bed_dirty = true;
+                }
             }
         }
 
@@ -304,17 +345,20 @@ async fn main() {
                     sim.current_state_mut().h[idx] *= 0.82;
                 }
             }
-            sim.upload_state();
+            sim.upload_water_depth();
         }
 
         // --- 5. Simulation Stepping ---
         if !is_paused {
             // Adaptive sub-stepping: compute maximum safe dt according to CFL (target CFL = 0.45)
             let max_cfl_dt = sim.compute_max_stable_dt(0.45);
+            safe_dt = max_cfl_dt;
             let frame_sim_time = 0.012f32;
             current_sub_dt = frame_sim_time.min(max_cfl_dt.min(0.004));
             sim.step_subdivided(frame_sim_time, current_sub_dt);
         }
+
+        frame_count += 1;
 
         // Sync data back to CPU for rendering
         sim.sync_to_cpu();
@@ -324,89 +368,102 @@ async fn main() {
         let state = sim.current_state();
 
         // --- 6. Topographic Hillshade, Soil Moisture & Suspended Sediment Shading ---
-        for y in 0..desc.grid_res_y {
-            for x in 0..desc.grid_res_x {
-                let idx = state.idx(x, y);
-                let z = state.z_bed[idx];
-                let depth = state.h[idx];
-                let sat = state.soil_sat[idx].clamp(0.0, 1.0);
-                let byte_idx = idx * 4;
+        if bed_dirty || (!is_paused && frame_count.is_multiple_of(4)) {
+            bed_dirty = false;
+            compute_hillshade_parallel(
+                &state.z_bed,
+                &mut shade_cache,
+                desc.grid_res_x as usize,
+                desc.grid_res_y as usize,
+            );
+        }
 
-                // 3D Directional hillshading: finite differences to estimate slope
-                let x_prev = if x > 0 { state.idx(x - 1, y) } else { idx };
-                let x_next = if x < desc.grid_res_x - 1 { state.idx(x + 1, y) } else { idx };
-                let y_prev = if y > 0 { state.idx(x, y - 1) } else { idx };
-                let y_next = if y < desc.grid_res_y - 1 { state.idx(x, y + 1) } else { idx };
+        let width = desc.grid_res_x as usize;
+        let row_bytes = width * 4;
 
-                let dz_x = (state.z_bed[x_next] - state.z_bed[x_prev]) * 0.5;
-                let dz_y = (state.z_bed[y_next] - state.z_bed[y_prev]) * 0.5;
-                let shade = (1.0 - 0.28 * (dz_x + dz_y)).clamp(0.60, 1.40);
+        img.bytes
+            .par_chunks_exact_mut(row_bytes)
+            .enumerate()
+            .for_each(|(y, row_slice)| {
+                let row_offset = y * width;
+                for x in 0..width {
+                    let idx = row_offset + x;
+                    let byte_idx = x * 4;
 
-                // Terrain color palette based on elevation
-                let (tr, tg, tb) = if z < 0.9 {
-                    // Moist gravel / wet sand
-                    (155.0, 130.0, 95.0)
-                } else if z < 2.2 {
-                    // Golden beach sand dunes
-                    (215.0, 185.0, 135.0)
-                } else {
-                    // Rocky canyon wall
-                    (160.0, 145.0, 130.0)
-                };
+                    let z = state.z_bed[idx];
+                    let depth = state.h[idx];
+                    let sat = state.soil_sat[idx].clamp(0.0, 1.0);
+                    let shade = shade_cache[idx];
 
-                // Soil moisture / saturation effect: wet sand darkens naturally
-                let moisture_darkening = 1.0 - 0.32 * sat;
-                let r_land = (tr * shade * moisture_darkening).clamp(0.0, 255.0);
-                let g_land = (tg * shade * moisture_darkening).clamp(0.0, 255.0);
-                let b_land = (tb * shade * moisture_darkening).clamp(0.0, 255.0);
-
-                if depth > 0.005 {
-                    // Distinct water depth gradient:
-                    // Shallow: clear, translucent turquoise (depth of riverbed clearly visible through it!)
-                    // Mid: rich tropical cyan/azure
-                    // Deep: deep ocean navy
-                    let (wr, wg, wb) = if depth < 0.12 {
-                        (40.0, 175.0, 205.0)
-                    } else if depth < 0.60 {
-                        (25.0, 110.0, 195.0)
+                    // Terrain color palette based on elevation
+                    let (tr, tg, tb) = if z < 0.9 {
+                        // Moist gravel / wet sand
+                        (155.0, 130.0, 95.0)
+                    } else if z < 2.2 {
+                        // Golden beach sand dunes
+                        (215.0, 185.0, 135.0)
                     } else {
-                        (10.0, 45.0, 140.0)
+                        // Rocky canyon wall
+                        (160.0, 145.0, 130.0)
                     };
 
-                    // Suspended sediment tinting: muddy silty river brown where erosion occurs
-                    let c = state.sediment_c[idx].clamp(0.0, 0.5);
-                    let turbidity = (c / 0.08).clamp(0.0, 1.0);
-                    let (mud_r, mud_g, mud_b) = (165.0, 115.0, 65.0);
-                    let base_water_r = wr * (1.0 - turbidity) + mud_r * turbidity;
-                    let base_water_g = wg * (1.0 - turbidity) + mud_g * turbidity;
-                    let base_water_b = wb * (1.0 - turbidity) + mud_b * turbidity;
+                    // Soil moisture / saturation effect: wet sand darkens naturally
+                    let moisture_darkening = 1.0 - 0.32 * sat;
+                    let r_land = (tr * shade * moisture_darkening).clamp(0.0, 255.0);
+                    let g_land = (tg * shade * moisture_darkening).clamp(0.0, 255.0);
+                    let b_land = (tb * shade * moisture_darkening).clamp(0.0, 255.0);
 
-                    // Rapids foam: ONLY appears in violent rapids or plunge pools (> 2.8 m/s),
-                    // capped at 45% max opacity so it never completely washes out the water color.
-                    // Normal river flow velocity (0.5 - 2.5 m/s) has foam = 0.0!
-                    let u = state.u[idx];
-                    let v = state.v[idx];
-                    let speed = (u * u + v * v).sqrt();
-                    let foam = ((speed - 2.8).max(0.0) / 3.0).clamp(0.0, 0.45);
+                    if depth > 0.005 {
+                        // Distinct water depth gradient:
+                        // Shallow: clear, translucent turquoise (depth of riverbed clearly visible through it!)
+                        // Mid: rich tropical cyan/azure
+                        // Deep: deep ocean navy
+                        let (wr, wg, wb) = if depth < 0.12 {
+                            (40.0, 175.0, 205.0)
+                        } else if depth < 0.60 {
+                            (25.0, 110.0, 195.0)
+                        } else {
+                            (10.0, 45.0, 140.0)
+                        };
 
-                    // Water transparency: shallow water is translucent (alpha ~ 0.38) so the riverbed shows through cleanly
-                    let water_alpha = (depth / 0.80).clamp(0.38, 0.92);
-                    let final_wr = base_water_r * (1.0 - foam) + 245.0 * foam;
-                    let final_wg = base_water_g * (1.0 - foam) + 250.0 * foam;
-                    let final_wb = base_water_b * (1.0 - foam) + 255.0 * foam;
+                        // Suspended sediment tinting: muddy silty river brown where erosion occurs
+                        let c = state.sediment_c[idx].clamp(0.0, 0.5);
+                        let turbidity = (c / 0.08).clamp(0.0, 1.0);
+                        let (mud_r, mud_g, mud_b) = (165.0, 115.0, 65.0);
+                        let base_water_r = wr * (1.0 - turbidity) + mud_r * turbidity;
+                        let base_water_g = wg * (1.0 - turbidity) + mud_g * turbidity;
+                        let base_water_b = wb * (1.0 - turbidity) + mud_b * turbidity;
 
-                    img.bytes[byte_idx] = (r_land * (1.0 - water_alpha) + final_wr * water_alpha) as u8;
-                    img.bytes[byte_idx + 1] = (g_land * (1.0 - water_alpha) + final_wg * water_alpha) as u8;
-                    img.bytes[byte_idx + 2] = (b_land * (1.0 - water_alpha) + final_wb * water_alpha) as u8;
-                    img.bytes[byte_idx + 3] = 255;
-                } else {
-                    img.bytes[byte_idx] = r_land as u8;
-                    img.bytes[byte_idx + 1] = g_land as u8;
-                    img.bytes[byte_idx + 2] = b_land as u8;
-                    img.bytes[byte_idx + 3] = 255;
+                        // Rapids foam: ONLY appears in violent rapids or plunge pools (> 2.8 m/s),
+                        // capped at 45% max opacity so it never completely washes out the water color.
+                        let u = state.u[idx];
+                        let v = state.v[idx];
+                        let speed_sq = u * u + v * v;
+                        let foam = if speed_sq > 7.84 {
+                            let speed = speed_sq.sqrt();
+                            ((speed - 2.8) / 3.0).clamp(0.0, 0.45)
+                        } else {
+                            0.0
+                        };
+
+                        // Water transparency: shallow water is translucent (alpha ~ 0.38) so the riverbed shows through cleanly
+                        let water_alpha = (depth / 0.80).clamp(0.38, 0.92);
+                        let final_wr = base_water_r * (1.0 - foam) + 245.0 * foam;
+                        let final_wg = base_water_g * (1.0 - foam) + 250.0 * foam;
+                        let final_wb = base_water_b * (1.0 - foam) + 255.0 * foam;
+
+                        row_slice[byte_idx] = (r_land * (1.0 - water_alpha) + final_wr * water_alpha) as u8;
+                        row_slice[byte_idx + 1] = (g_land * (1.0 - water_alpha) + final_wg * water_alpha) as u8;
+                        row_slice[byte_idx + 2] = (b_land * (1.0 - water_alpha) + final_wb * water_alpha) as u8;
+                        row_slice[byte_idx + 3] = 255;
+                    } else {
+                        row_slice[byte_idx] = r_land as u8;
+                        row_slice[byte_idx + 1] = g_land as u8;
+                        row_slice[byte_idx + 2] = b_land as u8;
+                        row_slice[byte_idx + 3] = 255;
+                    }
                 }
-            }
-        }
+            });
 
         texture.update(&img);
 
@@ -428,7 +485,7 @@ async fn main() {
 
         // Mode: Flow Lines (Grid Vectors)
         if flow_vis_mode == FlowVisMode::Both || flow_vis_mode == FlowVisMode::Vectors {
-            let step: usize = 16;
+            let step: usize = 20;
             for gy in (step / 2..desc.grid_res_y as usize).step_by(step) {
                 for gx in (step / 2..desc.grid_res_x as usize).step_by(step) {
                     let idx = state.idx(gx as u32, gy as u32);
@@ -436,8 +493,9 @@ async fn main() {
                     if depth > 0.02 {
                         let u = state.u[idx];
                         let v = state.v[idx];
-                        let speed = (u * u + v * v).sqrt();
-                        if speed > 0.05 {
+                        let speed_sq = u * u + v * v;
+                        if speed_sq > 0.0064 {
+                            let speed = speed_sq.sqrt();
                             let sx = (gx as f32 + 0.5) / desc.grid_res_x as f32 * screen_w;
                             let sy = (gy as f32 + 0.5) / desc.grid_res_y as f32 * screen_h;
                             let dir_x = u / speed;
@@ -449,7 +507,7 @@ async fn main() {
                             let alpha = (speed / 1.5).clamp(0.30, 0.85);
 
                             draw_line(sx, sy, ex, ey, 1.6, Color::new(0.70, 0.92, 1.0, alpha));
-                            draw_circle(ex, ey, 1.4, Color::new(1.0, 1.0, 1.0, alpha * 0.95));
+                            draw_circle(ex, ey, 1.3, Color::new(1.0, 1.0, 1.0, alpha * 0.95));
                         }
                     }
                 }
@@ -499,16 +557,19 @@ async fn main() {
                     let speed_alpha = (p.speed / 1.0).clamp(0.25, 0.95);
                     let alpha = life_alpha * speed_alpha;
                     draw_line(sx0, sy0, sx1, sy1, 1.8, Color::new(0.88, 0.96, 1.0, alpha));
-                    draw_circle(sx1, sy1, 1.3, Color::new(1.0, 1.0, 1.0, alpha));
+                    if speed_alpha > 0.40 {
+                        draw_circle(sx1, sy1, 1.2, Color::new(1.0, 1.0, 1.0, alpha * 0.90));
+                    }
                 }
             }
         }
 
         // --- 8. HUD Telemetry & Control Overlays ---
-        let safe_dt = sim.compute_max_stable_dt(0.5);
-        let fluid_mass = sim.total_fluid_mass();
-        let sed_mass = sim.total_sediment_mass();
-        let max_c = state.sediment_c.iter().copied().fold(0.0f32, f32::max);
+        if frame_count.is_multiple_of(12) {
+            cached_fluid_mass = sim.total_fluid_mass();
+            cached_sed_mass = sim.total_sediment_mass();
+            cached_max_c = state.sediment_c.iter().copied().fold(0.0f32, f32::max);
+        }
 
         // Top bar
         draw_rectangle(8.0, 8.0, 540.0, 134.0, Color::new(0.0, 0.0, 0.0, 0.80));
@@ -570,9 +631,9 @@ async fn main() {
         draw_text(
             format!(
                 "Fluid: {:.0} m³ | Solid Sed: {:.0} m³ | Max C: {:.1}%",
-                fluid_mass,
-                sed_mass,
-                max_c * 100.0
+                cached_fluid_mass,
+                cached_sed_mass,
+                cached_max_c * 100.0
             ),
             16.0,
             120.0,

@@ -564,6 +564,104 @@ impl WgpuSimulator {
         self.queue.write_buffer(&self.buf_sat[in_idx], 0, bytemuck::cast_slice(&self.cpu_grid.current.soil_sat));
         self.queue.write_buffer(&self.buf_bedrock, 0, bytemuck::cast_slice(&self.cpu_grid.current.bedrock_z));
     }
+
+    /// Uploads host CPU fluid depth modifications (`h`) to the active GPU compute storage buffer.
+    pub fn upload_water_depth(&mut self) {
+        let in_idx = self.ping_pong;
+        self.queue.write_buffer(&self.buf_h[in_idx], 0, bytemuck::cast_slice(&self.cpu_grid.current.h));
+    }
+
+    /// Subdivides the total simulation duration `total_dt` into uniform stable sub-steps
+    /// and encodes all passes into a single command buffer submission to eliminate GPU driver bubbles.
+    pub fn step_subdivided(&mut self, total_dt: f32, max_sub_dt: f32) {
+        if total_dt <= 1e-6 {
+            return;
+        }
+        let steps = (total_dt / max_sub_dt).ceil().max(1.0) as usize;
+        let dt = total_dt / steps as f32;
+
+        self.queue.write_buffer(&self.buf_dt, 0, bytemuck::bytes_of(&dt));
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Subdivided Compute Passes"),
+        });
+        let workgroups_x = self.cpu_grid.descriptor.grid_res_x.div_ceil(16);
+        let workgroups_y = self.cpu_grid.descriptor.grid_res_y.div_ceil(16);
+
+        for _ in 0..steps {
+            let pp = self.ping_pong;
+
+            // Pass 1: SWE Interior Kernel
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("SWE Main Pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.swe_pipeline);
+                cpass.set_bind_group(0, &self.bg_swe[pp], &[]);
+                cpass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
+            }
+
+            // Pass 2: SWE Boundary Reflection
+            {
+                let mut bpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("SWE Boundary Pass"),
+                    timestamp_writes: None,
+                });
+                bpass.set_pipeline(&self.swe_boundary_pipeline);
+                bpass.set_bind_group(0, &self.bg_swe[pp], &[]);
+                bpass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
+            }
+
+            // Pass 3: Soil Saturation Tracking
+            {
+                let mut spass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Saturation Pass"),
+                    timestamp_writes: None,
+                });
+                spass.set_pipeline(&self.sat_pipeline);
+                spass.set_bind_group(0, &self.bg_sat[pp], &[]);
+                spass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
+            }
+
+            // Pass 4: Exner Sediment Exchange
+            {
+                let mut epass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Exner Pass"),
+                    timestamp_writes: None,
+                });
+                epass.set_pipeline(&self.exner_pipeline);
+                epass.set_bind_group(0, &self.bg_exner[pp], &[]);
+                epass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
+            }
+
+            // Pass 5: Talus Angle-of-Repose Relaxation
+            {
+                let mut tpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Talus Pass"),
+                    timestamp_writes: None,
+                });
+                tpass.set_pipeline(&self.talus_pipeline);
+                tpass.set_bind_group(0, &self.bg_talus[pp], &[]);
+                tpass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
+            }
+
+            // Pass 6: Sediment Fields Boundary Reflection
+            {
+                let mut sbpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Sed Boundary Pass"),
+                    timestamp_writes: None,
+                });
+                sbpass.set_pipeline(&self.sed_boundary_pipeline);
+                sbpass.set_bind_group(0, &self.bg_sed_boundary[pp], &[]);
+                sbpass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
+            }
+
+            self.ping_pong = 1 - self.ping_pong;
+        }
+
+        self.queue.submit(Some(encoder.finish()));
+    }
 }
 
 impl SimulationBackend for WgpuSimulator {
@@ -577,6 +675,10 @@ impl SimulationBackend for WgpuSimulator {
 
     fn step(&mut self, dt: f32) {
         self.step(dt);
+    }
+
+    fn step_subdivided(&mut self, total_dt: f32, max_sub_dt: f32) {
+        self.step_subdivided(total_dt, max_sub_dt);
     }
 
     fn sync_to_cpu(&mut self) {
@@ -597,6 +699,10 @@ impl SimulationBackend for WgpuSimulator {
 
     fn upload_state(&mut self) {
         self.upload_state();
+    }
+
+    fn upload_water_depth(&mut self) {
+        self.upload_water_depth();
     }
 
     fn compute_max_stable_dt(&self, cfl: f32) -> f32 {
