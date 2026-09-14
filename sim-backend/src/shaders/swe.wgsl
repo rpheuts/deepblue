@@ -32,8 +32,8 @@ struct StepParams {
 
     west_outflow_rate: f32,
     east_outflow_rate: f32,
-    pad0: f32,
-    pad1: f32,
+    stream_inflow_active: f32,
+    coastal_sink_active: f32,
 }
 
 @group(0) @binding(0) var<uniform> domain: SimDomain;
@@ -209,6 +209,27 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let friction_factor = 1.0 / (1.0 + drag);
         u_next = raw_u * friction_factor;
         v_next = raw_v * friction_factor;
+    }
+ 
+    // Stream source injection (top center)
+    if (params.stream_inflow_active > 0.5) {
+        let inflow_x_center = i32(width / 2u);
+        let inflow_radius = max(3, i32(f32(width) * 0.03));
+        let inflow_y_end = max(4, i32(f32(height) * 0.04));
+        if (y >= 1u && i32(y) <= inflow_y_end && abs(i32(x) - inflow_x_center) <= inflow_radius) {
+            let target_h = max(0.6, 2.6 - z_c);
+            if (h_next < target_h) {
+                h_next = target_h;
+            }
+        }
+    }
+
+    // Coastal sink: absorb fluid entering bottom boundary into the ocean
+    if (params.coastal_sink_active > 0.5) {
+        let h_start = height - 12u;
+        if (y >= h_start && y < height - 1u && x >= 1u && x < width - 1u) {
+            h_next = h_next * 0.82;
+        }
     }
 
     out_h[idx] = h_next;

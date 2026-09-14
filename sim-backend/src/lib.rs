@@ -4,6 +4,7 @@ use sim_core::domain::SimDomainDescriptor;
 use sim_core::state::GridState;
 use wgpu::util::DeviceExt;
 use std::borrow::Cow;
+use std::sync::Arc;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -30,12 +31,35 @@ pub struct GpuStepParams {
 
     pub west_outflow_rate: f32,
     pub east_outflow_rate: f32,
+    pub stream_inflow_active: f32,
+    pub coastal_sink_active: f32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BrushParams {
+    pub center_x: f32,
+    pub center_y: f32,
+    pub radius: f32,
+    pub strength: f32,
+    pub tool_type: u32,
+    pub grid_res_x: u32,
+    pub grid_res_y: u32,
+    pub extent_x: f32,
+    pub extent_y: f32,
     pub pad0: f32,
     pub pad1: f32,
+    pub pad2: f32,
 }
 
 impl GpuStepParams {
-    pub fn new(dt: f32, time: f32, b: &sim_core::boundary::DomainBoundaryConfig) -> Self {
+    pub fn new(
+        dt: f32,
+        time: f32,
+        b: &sim_core::boundary::DomainBoundaryConfig,
+        stream_inflow_active: bool,
+        coastal_sink_active: bool,
+    ) -> Self {
         let mut p = Self {
             dt,
             time,
@@ -57,8 +81,8 @@ impl GpuStepParams {
             east_type: 0,
             west_outflow_rate: 0.0,
             east_outflow_rate: 0.0,
-            pad0: 0.0,
-            pad1: 0.0,
+            stream_inflow_active: if stream_inflow_active { 1.0 } else { 0.0 },
+            coastal_sink_active: if coastal_sink_active { 1.0 } else { 0.0 },
         };
 
         match b.south {
@@ -127,8 +151,8 @@ impl GpuStepParams {
 }
 
 pub struct WgpuSimulator {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
     
     // Pipelines
     swe_pipeline: wgpu::ComputePipeline,
@@ -137,6 +161,8 @@ pub struct WgpuSimulator {
     exner_pipeline: wgpu::ComputePipeline,
     talus_pipeline: wgpu::ComputePipeline,
     sed_boundary_pipeline: wgpu::ComputePipeline,
+    export_pipeline: wgpu::ComputePipeline,
+    brush_pipeline: wgpu::ComputePipeline,
     
     // Bind groups (ping-pong [0] for read 0 -> write 1, [1] for read 1 -> write 0)
     bg_swe: [wgpu::BindGroup; 2],
@@ -144,13 +170,30 @@ pub struct WgpuSimulator {
     bg_exner: [wgpu::BindGroup; 2],
     bg_talus: [wgpu::BindGroup; 2],
     bg_sed_boundary: [wgpu::BindGroup; 2],
+    bg_export: [wgpu::BindGroup; 2],
+    bg_brush: wgpu::BindGroup,
+
+    // Exportable GPU 2D Textures (Zero-Copy VRAM - AGENTS.md contract)
+    tex_elevation: wgpu::Texture,
+    view_elevation: wgpu::TextureView,
+    tex_water: wgpu::Texture,
+    view_water: wgpu::TextureView,
+    tex_velocity: wgpu::Texture,
+    view_velocity: wgpu::TextureView,
+    tex_sed_sat: wgpu::Texture,
+    view_sed_sat: wgpu::TextureView,
     
     // Cached CPU state for readback and interactions
     pub cpu_grid: DoubleBufferedGrid,
     
+    // Continuous stream and coastal sink settings
+    pub stream_inflow_active: bool,
+    pub coastal_sink_active: bool,
+
     // GPU Uniform Buffers
     _buf_domain: wgpu::Buffer,
     buf_dt: wgpu::Buffer,
+    buf_brush: wgpu::Buffer,
     
     // Ping-pong storage buffers
     buf_h: [wgpu::Buffer; 2],
@@ -174,28 +217,11 @@ pub struct WgpuSimulator {
 }
 
 impl WgpuSimulator {
-    /// Asynchronously initializes a new GPU-accelerated hydraulic & sediment simulator.
-    pub async fn new(mut cpu_grid: DoubleBufferedGrid) -> Self {
+    /// Initializes a GPU-accelerated hydraulic & sediment simulator from an existing wgpu Device and Queue.
+    /// This enables zero-copy texture sharing with renderers and window surfaces on the exact same GPU context.
+    pub fn from_device(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>, mut cpu_grid: DoubleBufferedGrid) -> Self {
         cpu_grid.current.apply_reflective_boundaries();
         cpu_grid.next.apply_reflective_boundaries();
-
-        // Initialize WGPU (Force Primary backends to avoid EGL/GL conflicts with Macroquad)
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
-            ..Default::default()
-        });
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                ..Default::default()
-            })
-            .await
-            .expect("Failed to find wgpu adapter");
-
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default(), None)
-            .await
-            .expect("Failed to create wgpu device");
 
         // Load shader modules
         let swe_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -217,6 +243,14 @@ impl WgpuSimulator {
         let sed_boundary_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Sediment Boundary Shader"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders/sediment_boundary.wgsl"))),
+        });
+        let export_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Export Textures Shader"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders/export_textures.wgsl"))),
+        });
+        let brush_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Brush Shader"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("shaders/brush.wgsl"))),
         });
 
         // Compute pipelines
@@ -277,6 +311,24 @@ impl WgpuSimulator {
         });
         let sed_bg_layout = sed_boundary_pipeline.get_bind_group_layout(0);
 
+        let export_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Export Pipeline"),
+            layout: None,
+            module: &export_shader,
+            entry_point: "main",
+            compilation_options: Default::default(),
+        });
+        let export_bg_layout = export_pipeline.get_bind_group_layout(0);
+
+        let brush_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Brush Pipeline"),
+            layout: None,
+            module: &brush_shader,
+            entry_point: "main",
+            compilation_options: Default::default(),
+        });
+        let brush_bg_layout = brush_pipeline.get_bind_group_layout(0);
+
         // Uniform buffers
         let buf_domain = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Domain Buffer"),
@@ -284,11 +336,18 @@ impl WgpuSimulator {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let initial_params = GpuStepParams::new(0.016, cpu_grid.time, &cpu_grid.boundaries);
+        let initial_params = GpuStepParams::new(0.016, cpu_grid.time, &cpu_grid.boundaries, false, false);
         let buf_dt = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Step Params Buffer"),
             contents: bytemuck::bytes_of(&initial_params),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let buf_brush = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Brush Params Buffer"),
+            size: std::mem::size_of::<BrushParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
 
         // Storage buffers
@@ -459,6 +518,88 @@ impl WgpuSimulator {
             }),
         ];
 
+        // 2D Textures for Zero-Copy rendering (AGENTS.md contract)
+        let width = cpu_grid.descriptor.grid_res_x;
+        let height = cpu_grid.descriptor.grid_res_y;
+
+        let make_tex = |label: &str, format: wgpu::TextureFormat| {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+            (tex, view)
+        };
+
+        let (tex_elevation, view_elevation) = make_tex("ElevationMap", wgpu::TextureFormat::R32Float);
+        let (tex_water, view_water) = make_tex("WaterMap", wgpu::TextureFormat::Rgba32Float);
+        let (tex_velocity, view_velocity) = make_tex("VelocityMap", wgpu::TextureFormat::Rgba32Float);
+        let (tex_sed_sat, view_sed_sat) = make_tex("SedimentWetnessMap", wgpu::TextureFormat::Rgba32Float);
+
+        let bg_export = [
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Export BG 0"),
+                layout: &export_bg_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: buf_domain.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: buf_h[0].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: buf_u[0].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: buf_v[0].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: buf_z[0].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: buf_c[0].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6, resource: buf_sat[0].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 7, resource: buf_bedrock.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&view_elevation) },
+                    wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(&view_water) },
+                    wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(&view_velocity) },
+                    wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(&view_sed_sat) },
+                ],
+            }),
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Export BG 1"),
+                layout: &export_bg_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: buf_domain.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: buf_h[1].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: buf_u[1].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: buf_v[1].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: buf_z[1].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: buf_c[1].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6, resource: buf_sat[1].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 7, resource: buf_bedrock.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&view_elevation) },
+                    wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(&view_water) },
+                    wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(&view_velocity) },
+                    wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(&view_sed_sat) },
+                ],
+            }),
+        ];
+
+        let bg_brush = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Brush BG"),
+            layout: &brush_bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: buf_brush.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: buf_h[0].as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: buf_h[1].as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: buf_z[0].as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: buf_z[1].as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: buf_bedrock.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: buf_sat[0].as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: buf_sat[1].as_entire_binding() },
+            ],
+        });
+
         // Staging buffers for readback
         let make_staging = |label: &str| {
             device.create_buffer(&wgpu::BufferDescriptor {
@@ -476,7 +617,7 @@ impl WgpuSimulator {
         let staging_c = make_staging("Staging C");
         let staging_sat = make_staging("Staging Sat");
 
-        Self {
+        let mut sim = Self {
             device,
             queue,
             swe_pipeline,
@@ -485,14 +626,27 @@ impl WgpuSimulator {
             exner_pipeline,
             talus_pipeline,
             sed_boundary_pipeline,
+            export_pipeline,
+            brush_pipeline,
             bg_swe,
             bg_sat,
             bg_exner,
             bg_talus,
             bg_sed_boundary,
+            bg_export,
+            bg_brush,
+            tex_elevation,
+            view_elevation,
+            tex_water,
+            view_water,
+            tex_velocity,
+            view_velocity,
+            tex_sed_sat,
+            view_sed_sat,
             cpu_grid,
             _buf_domain: buf_domain,
             buf_dt,
+            buf_brush,
             buf_h,
             buf_u,
             buf_v,
@@ -508,7 +662,34 @@ impl WgpuSimulator {
             staging_sat,
             buffer_byte_size,
             ping_pong: 0,
-        }
+            stream_inflow_active: false,
+            coastal_sink_active: false,
+        };
+
+        sim.export_textures();
+        sim
+    }
+
+    /// Asynchronously initializes a new GPU-accelerated hydraulic & sediment simulator.
+    pub async fn new(cpu_grid: DoubleBufferedGrid) -> Self {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY,
+            ..Default::default()
+        });
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                ..Default::default()
+            })
+            .await
+            .expect("Failed to find wgpu adapter");
+
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor::default(), None)
+            .await
+            .expect("Failed to create wgpu device");
+
+        Self::from_device(Arc::new(device), Arc::new(queue), cpu_grid)
     }
 
     /// Synchronously initializes the GPU simulator via blocking execution.
@@ -519,7 +700,13 @@ impl WgpuSimulator {
     /// Advances the GPU compute simulation forward by a single time step `dt`.
     pub fn step(&mut self, dt: f32) {
         self.cpu_grid.time += dt;
-        let gpu_params = GpuStepParams::new(dt, self.cpu_grid.time, &self.cpu_grid.boundaries);
+        let gpu_params = GpuStepParams::new(
+            dt,
+            self.cpu_grid.time,
+            &self.cpu_grid.boundaries,
+            self.stream_inflow_active,
+            self.coastal_sink_active,
+        );
         self.queue.write_buffer(&self.buf_dt, 0, bytemuck::bytes_of(&gpu_params));
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -593,8 +780,20 @@ impl WgpuSimulator {
             sbpass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
         }
 
-        self.queue.submit(Some(encoder.finish()));
         self.ping_pong = 1 - self.ping_pong;
+
+        // Pass 7: Texture Export Pass (Zero-Copy VRAM)
+        {
+            let mut exp_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Export Textures Pass"),
+                timestamp_writes: None,
+            });
+            exp_pass.set_pipeline(&self.export_pipeline);
+            exp_pass.set_bind_group(0, &self.bg_export[self.ping_pong], &[]);
+            exp_pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
+        }
+
+        self.queue.submit(Some(encoder.finish()));
     }
 
     /// Synchronously reads back the latest fluid depth, velocity, bed, and sediment fields from GPU.
@@ -688,12 +887,60 @@ impl WgpuSimulator {
         self.queue.write_buffer(&self.buf_c[in_idx], 0, bytemuck::cast_slice(&self.cpu_grid.current.sediment_c));
         self.queue.write_buffer(&self.buf_sat[in_idx], 0, bytemuck::cast_slice(&self.cpu_grid.current.soil_sat));
         self.queue.write_buffer(&self.buf_bedrock, 0, bytemuck::cast_slice(&self.cpu_grid.current.bedrock_z));
+        self.export_textures();
     }
 
     /// Uploads host CPU fluid depth modifications (`h`) to the active GPU compute storage buffer.
     pub fn upload_water_depth(&mut self) {
         let in_idx = self.ping_pong;
         self.queue.write_buffer(&self.buf_h[in_idx], 0, bytemuck::cast_slice(&self.cpu_grid.current.h));
+        self.export_textures();
+    }
+
+    /// Dispatches an in-situ GPU compute brush operation directly mutating active VRAM storage buffers.
+    /// This avoids host-to-device bus transfers and prevents resetting living waves, velocities, or flow.
+    pub fn apply_brush(
+        &mut self,
+        center_x: f32,
+        center_y: f32,
+        radius: f32,
+        strength: f32,
+        tool_type: u32,
+    ) {
+        let params = BrushParams {
+            center_x,
+            center_y,
+            radius,
+            strength,
+            tool_type,
+            grid_res_x: self.cpu_grid.descriptor.grid_res_x,
+            grid_res_y: self.cpu_grid.descriptor.grid_res_y,
+            extent_x: self.cpu_grid.descriptor.extent_x,
+            extent_y: self.cpu_grid.descriptor.extent_y,
+            pad0: 0.0,
+            pad1: 0.0,
+            pad2: 0.0,
+        };
+        self.queue.write_buffer(&self.buf_brush, 0, bytemuck::bytes_of(&params));
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Brush Compute Command Encoder"),
+        });
+
+        {
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Brush Compute Pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.brush_pipeline);
+            cpass.set_bind_group(0, &self.bg_brush, &[]);
+            let workgroups_x = self.cpu_grid.descriptor.grid_res_x.div_ceil(16);
+            let workgroups_y = self.cpu_grid.descriptor.grid_res_y.div_ceil(16);
+            cpass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
+        }
+
+        self.queue.submit(Some(encoder.finish()));
+        self.export_textures();
     }
 
     /// Subdivides the total simulation duration `total_dt` into uniform stable sub-steps
@@ -706,7 +953,13 @@ impl WgpuSimulator {
         let steps = (total_dt / max_sub_dt).ceil().max(1.0) as usize;
         let dt = total_dt / steps as f32;
 
-        let gpu_params = GpuStepParams::new(dt, self.cpu_grid.time, &self.cpu_grid.boundaries);
+        let gpu_params = GpuStepParams::new(
+            dt,
+            self.cpu_grid.time,
+            &self.cpu_grid.boundaries,
+            self.stream_inflow_active,
+            self.coastal_sink_active,
+        );
         self.queue.write_buffer(&self.buf_dt, 0, bytemuck::bytes_of(&gpu_params));
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -787,7 +1040,105 @@ impl WgpuSimulator {
             self.ping_pong = 1 - self.ping_pong;
         }
 
+        // Pass 7: Texture Export Pass (Zero-Copy VRAM)
+        {
+            let mut exp_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Export Textures Pass"),
+                timestamp_writes: None,
+            });
+            exp_pass.set_pipeline(&self.export_pipeline);
+            exp_pass.set_bind_group(0, &self.bg_export[self.ping_pong], &[]);
+            exp_pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
+        }
+
         self.queue.submit(Some(encoder.finish()));
+    }
+
+    /// Explicitly executes the texture export pass to ensure 2D textures match current storage buffers.
+    pub fn export_textures(&mut self) {
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Manual Export Encoder"),
+        });
+        let workgroups_x = self.cpu_grid.descriptor.grid_res_x.div_ceil(16);
+        let workgroups_y = self.cpu_grid.descriptor.grid_res_y.div_ceil(16);
+        {
+            let mut exp_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Export Textures Pass"),
+                timestamp_writes: None,
+            });
+            exp_pass.set_pipeline(&self.export_pipeline);
+            exp_pass.set_bind_group(0, &self.bg_export[self.ping_pong], &[]);
+            exp_pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+    }
+
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    pub fn elevation_view(&self) -> &wgpu::TextureView {
+        &self.view_elevation
+    }
+
+    pub fn water_view(&self) -> &wgpu::TextureView {
+        &self.view_water
+    }
+
+    pub fn velocity_view(&self) -> &wgpu::TextureView {
+        &self.view_velocity
+    }
+
+    pub fn sed_sat_view(&self) -> &wgpu::TextureView {
+        &self.view_sed_sat
+    }
+
+    pub fn active_buf_h(&self) -> &wgpu::Buffer {
+        &self.buf_h[self.ping_pong]
+    }
+
+    pub fn active_buf_u(&self) -> &wgpu::Buffer {
+        &self.buf_u[self.ping_pong]
+    }
+
+    pub fn active_buf_v(&self) -> &wgpu::Buffer {
+        &self.buf_v[self.ping_pong]
+    }
+
+    pub fn active_buf_z(&self) -> &wgpu::Buffer {
+        &self.buf_z[self.ping_pong]
+    }
+
+    pub fn active_buf_c(&self) -> &wgpu::Buffer {
+        &self.buf_c[self.ping_pong]
+    }
+
+    pub fn active_buf_sat(&self) -> &wgpu::Buffer {
+        &self.buf_sat[self.ping_pong]
+    }
+
+    pub fn buf_bedrock(&self) -> &wgpu::Buffer {
+        &self.buf_bedrock
+    }
+
+    pub fn elevation_texture(&self) -> &wgpu::Texture {
+        &self.tex_elevation
+    }
+
+    pub fn water_texture(&self) -> &wgpu::Texture {
+        &self.tex_water
+    }
+
+    pub fn velocity_texture(&self) -> &wgpu::Texture {
+        &self.tex_velocity
+    }
+
+    pub fn sed_sat_texture(&self) -> &wgpu::Texture {
+        &self.tex_sed_sat
     }
 }
 
@@ -848,6 +1199,14 @@ impl SimulationBackend for WgpuSimulator {
 
     fn sim_time(&self) -> f32 {
         self.cpu_grid.time
+    }
+
+    fn set_stream_inflow(&mut self, active: bool) {
+        self.stream_inflow_active = active;
+    }
+
+    fn set_coastal_sink(&mut self, active: bool) {
+        self.coastal_sink_active = active;
     }
 }
 
@@ -1092,6 +1451,45 @@ mod tests {
             post_total_water,
             total_diff
         );
+    }
+
+    #[test]
+    fn test_wgpu_zero_copy_texture_export() {
+        let desc = SimDomainDescriptor {
+            grid_res_x: 32,
+            grid_res_y: 32,
+            extent_x: 32.0,
+            extent_y: 32.0,
+            ..Default::default()
+        };
+
+        let mut grid = DoubleBufferedGrid::new(desc);
+        for i in 0..grid.current.z_bed.len() {
+            grid.current.z_bed[i] = 1.0;
+            grid.current.bedrock_z[i] = 0.5;
+            grid.current.soil_sat[i] = 0.8;
+            grid.current.h[i] = 0.5;
+            grid.current.u[i] = 1.2;
+        }
+
+        let mut sim = WgpuSimulator::new_sync(grid);
+
+        // Verify textures exist and match the contract
+        assert_eq!(sim.elevation_texture().format(), wgpu::TextureFormat::R32Float);
+        assert_eq!(sim.water_texture().format(), wgpu::TextureFormat::Rgba32Float);
+        assert_eq!(sim.velocity_texture().format(), wgpu::TextureFormat::Rgba32Float);
+        assert_eq!(sim.sed_sat_texture().format(), wgpu::TextureFormat::Rgba32Float);
+
+        assert_eq!(sim.elevation_texture().width(), 32);
+        assert_eq!(sim.elevation_texture().height(), 32);
+
+        // Advance simulation and verify export passes execute cleanly without GPU validation errors
+        for _ in 0..5 {
+            sim.step(0.01);
+        }
+
+        sim.export_textures();
+        assert!(sim.sim_time() > 0.04);
     }
 }
 

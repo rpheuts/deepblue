@@ -1,0 +1,16 @@
+[package]
+name = "sim-client-3d"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sim-core = { path = "../sim-core" }
+sim-backend = { path = "../sim-backend" }
+wgpu = "0.20"
+winit = "0.29"
+glam = "0.27"
+bytemuck = { version = "1.15", features = ["derive"] }
+pollster = "0.3"
+egui = "0.28"
+egui-wgpu = "0.28"
+egui-winit = "0.28"

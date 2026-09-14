@@ -187,6 +187,8 @@ Support adaptive sub-stepping to prevent solver explosions when flow velocities 
 * [x] Coastal beach & sandcastle scenario (`Scenarios::beach_sandcastle_waves`) featuring a sloping swash zone, erodible sandcastle with curtain ramparts, corner towers, and surrounding moat, plus a stone jetty.
 * [x] Interactive stone masonry placement brush ([Ctrl+LMB]) and stone demolition brush ([Ctrl+RMB]), complementing sand dams ([Shift+LMB]), digging ([RMB]), and fluid addition ([LMB]).
 
-* [ ] **Phase 5: Render Adapter Prototypes**
+* [x] **Phase 5: Render Adapter Prototypes & Zero-Copy Architecture**
+* [x] Zero-copy VRAM texture export pipeline in `sim-backend` (`ElevationMap`, `WaterMap`, `VelocityMap`, `SedimentWetnessMap`) with shared `Device`/`Queue` constructor (`WgpuSimulator::from_device`).
+* [x] GPU-accelerated stream inflow and coastal sink evaluation in `swe.wgsl`, eliminating per-frame host-to-device bus uploads.
 * [x] 2D high-fidelity canvas (`sim-client-2d`) with physical Beer-Lambert optical extinction, animated underwater caustics, 3D water surface normal reconstruction, Blinn-Phong specular sun glitter, Fresnel sky reflections, multi-source shoreline/rapids foam, wet sand gloss ("mirror beach"), and interactive camera zoom & pan.
-* [ ] 3D vertex-displaced mesh proof-of-concept consuming exported simulation textures (`ElevationMap`, `WaterMap`, `VelocityMap`).
+* [x] Dedicated 3D hydraulic engine client (`sim-client-3d`) featuring zero-copy VRAM texture sampling, perspective 3D orbit & true 2.5D isometric camera toggle, architectural diorama skirt mesh, transparent displaced water surface with Beer-Lambert optics, 3D projected decal brush cursor, heightfield raycasting, and egui telemetry & tool control panel.

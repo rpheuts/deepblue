@@ -500,36 +500,10 @@ async fn main() {
         }
 
         // --- 4. Continuous Flow Sources & Sinks (Beach Stream Preset) ---
-        if !is_paused && current_preset == ActivePreset::BeachStream {
-            if is_inflow_active {
-                // Mountain spring inlet feeding the reservoir at the top
-                let w = desc.grid_res_x;
-                let inflow_y_end = (desc.grid_res_y as f32 * 0.06) as u32;
-                let inflow_x_center = (w as f32 * 0.5) as u32;
-                let inflow_radius = (w as f32 * 0.05) as u32;
-
-                for y in 1..=inflow_y_end {
-                    for x in (inflow_x_center - inflow_radius)..=(inflow_x_center + inflow_radius) {
-                        let idx = sim.current_state().idx(x, y);
-                        let z = sim.current_state().z_bed[idx];
-                        let target_h = (2.6 - z).max(0.6);
-                        if sim.current_state().h[idx] < target_h {
-                            sim.current_state_mut().h[idx] = target_h;
-                        }
-                    }
-                }
-            }
-
-            // Coastal sink: absorb fluid entering the bottom boundary into the ocean
-            let h_start = desc.grid_res_y - 12;
-            for y in h_start..(desc.grid_res_y - 1) {
-                for x in 1..(desc.grid_res_x - 1) {
-                    let idx = sim.current_state().idx(x, y);
-                    sim.current_state_mut().h[idx] *= 0.82;
-                }
-            }
-            sim.upload_water_depth();
-        }
+        let stream_active = !is_paused && current_preset == ActivePreset::BeachStream && is_inflow_active;
+        let coastal_active = !is_paused && current_preset == ActivePreset::BeachStream;
+        sim.set_stream_inflow(stream_active);
+        sim.set_coastal_sink(coastal_active);
 
         // --- 5. Simulation Stepping ---
         if !is_paused {

@@ -2,6 +2,7 @@
 members = [
     "sim-core",
     "sim-backend",
-    "sim-client-2d"
+    "sim-client-2d",
+    "sim-client-3d"
 ]
 resolver = "2"

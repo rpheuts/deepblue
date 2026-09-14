@@ -80,6 +80,12 @@ pub trait SimulationBackend {
 
     /// Returns the total elapsed physical simulation time (in seconds).
     fn sim_time(&self) -> f32;
+
+    /// Enables or disables continuous stream inflow injection at the northern source zone.
+    fn set_stream_inflow(&mut self, _active: bool) {}
+
+    /// Enables or disables the southern coastal absorption sink.
+    fn set_coastal_sink(&mut self, _active: bool) {}
 }
 
 /// Headless reference CPU simulation backend.
@@ -91,6 +97,8 @@ pub struct CpuSimulator {
     pub swe_params: SweParams,
     pub sediment_params: crate::solver::sediment::SedimentParams,
     pub enable_sediment: bool,
+    pub stream_inflow_active: bool,
+    pub coastal_sink_active: bool,
 }
 
 impl CpuSimulator {
@@ -102,6 +110,8 @@ impl CpuSimulator {
             swe_params: SweParams::default(),
             sediment_params: crate::solver::sediment::SedimentParams::default(),
             enable_sediment: true,
+            stream_inflow_active: false,
+            coastal_sink_active: false,
         }
     }
 
@@ -113,6 +123,8 @@ impl CpuSimulator {
             swe_params,
             sediment_params: crate::solver::sediment::SedimentParams::default(),
             enable_sediment: true,
+            stream_inflow_active: false,
+            coastal_sink_active: false,
         }
     }
 
@@ -128,6 +140,8 @@ impl CpuSimulator {
             swe_params,
             sediment_params,
             enable_sediment: true,
+            stream_inflow_active: false,
+            coastal_sink_active: false,
         }
     }
 }
@@ -145,6 +159,36 @@ impl SimulationBackend for CpuSimulator {
         step_swe_with_params(&mut self.grid, dt, &self.swe_params);
         if self.enable_sediment {
             crate::solver::sediment::step_sediment(&mut self.grid, dt, &self.sediment_params);
+        }
+
+        if self.stream_inflow_active {
+            let width = self.grid.descriptor.grid_res_x as i32;
+            let height = self.grid.descriptor.grid_res_y as i32;
+            let inflow_x_center = width / 2;
+            let inflow_radius = (width as f32 * 0.03).max(3.0) as i32;
+            let inflow_y_end = (height as f32 * 0.04).max(4.0) as i32;
+            for y in 1..=inflow_y_end {
+                for x in (inflow_x_center - inflow_radius)..=(inflow_x_center + inflow_radius) {
+                    let idx = self.grid.current.idx(x as u32, y as u32);
+                    let z = self.grid.current.z_bed[idx];
+                    let target_h = (2.6 - z).max(0.6);
+                    if self.grid.current.h[idx] < target_h {
+                        self.grid.current.h[idx] = target_h;
+                    }
+                }
+            }
+        }
+
+        if self.coastal_sink_active {
+            let width = self.grid.descriptor.grid_res_x as i32;
+            let height = self.grid.descriptor.grid_res_y as i32;
+            let h_start = height - 12;
+            for y in h_start..(height - 1) {
+                for x in 1..(width - 1) {
+                    let idx = self.grid.current.idx(x as u32, y as u32);
+                    self.grid.current.h[idx] *= 0.82;
+                }
+            }
         }
     }
 
@@ -188,5 +232,13 @@ impl SimulationBackend for CpuSimulator {
 
     fn sim_time(&self) -> f32 {
         self.grid.time
+    }
+
+    fn set_stream_inflow(&mut self, active: bool) {
+        self.stream_inflow_active = active;
+    }
+
+    fn set_coastal_sink(&mut self, active: bool) {
+        self.coastal_sink_active = active;
     }
 }
