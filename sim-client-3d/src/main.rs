@@ -21,7 +21,7 @@ use camera::Camera;
 use context::RenderContext;
 use input::InputState;
 use mesh::{GridMesh, SkirtMesh};
-use passes::{ActiveTool, DecalPass, SelectedScenario, SkirtPass, TerrainPass, UiPass, UiState, WaterPass};
+use passes::{ActiveTool, DecalPass, SelectedScenario, SkirtPass, SkyPass, TerrainPass, UiPass, UiState, WaterPass};
 use raycast::HeightfieldRaycaster;
 
 fn main() {
@@ -79,6 +79,11 @@ fn main() {
         context.config.format,
         &context.camera_bind_group_layout,
         context.float32_filterable,
+    );
+    let sky_pass = SkyPass::new(
+        &context.device,
+        context.config.format,
+        &context.camera_bind_group_layout,
     );
     let mut ui_pass = UiPass::new(&window, &context.device, context.config.format);
 
@@ -140,6 +145,7 @@ fn main() {
 
                     WindowEvent::RedrawRequested => {
                         let now = Instant::now();
+                        let frame_start = now;
                         let dt_frame = now.duration_since(last_frame_time).as_secs_f32().min(0.10);
                         last_frame_time = now;
 
@@ -191,6 +197,10 @@ fn main() {
 
                         // Simulation Tick (Fixed-Timestep Accumulator for Temporal Decoupling)
                         if !ui_state.is_paused {
+                            let is_river = ui_state.selected_scenario == SelectedScenario::MeanderingRiver;
+                            sim.set_stream_inflow(is_river && ui_state.stream_inflow_enabled);
+                            sim.set_coastal_sink(is_river && ui_state.coastal_sink_enabled);
+
                             let wind_dir = ui_state.wind_dir();
                             sim.set_wind_full(
                                 ui_state.wind_speed,
@@ -313,9 +323,9 @@ fn main() {
                                     resolve_target: None,
                                     ops: wgpu::Operations {
                                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                                            r: 0.045,
-                                            g: 0.055,
-                                            b: 0.075,
+                                            r: 0.76,
+                                            g: 0.84,
+                                            b: 0.94,
                                             a: 1.0,
                                         }),
                                         store: wgpu::StoreOp::Store,
@@ -332,6 +342,9 @@ fn main() {
                                 occlusion_query_set: None,
                                 timestamp_writes: None,
                             });
+
+                            // 0. Procedural Sky Dome & Drifting Clouds Pass
+                            sky_pass.render(&mut rpass, &context.camera_bind_group);
 
                             // 1. Skirt / Diorama Perimeter Pass
                             skirt_pass.render(&mut rpass, &context.camera_bind_group, &skirt_bg, &skirt_mesh);
@@ -359,6 +372,21 @@ fn main() {
 
                         context.queue.submit(Some(encoder.finish()));
                         output.present();
+
+                        // Enforce target FPS limit if specified
+                        if let Some(target_fps) = ui_state.fps_limit.target_fps() {
+                            let target_duration = std::time::Duration::from_nanos(1_000_000_000 / target_fps as u64);
+                            let elapsed = frame_start.elapsed();
+                            if elapsed < target_duration {
+                                let sleep_duration = target_duration - elapsed;
+                                if sleep_duration > std::time::Duration::from_millis(2) {
+                                    std::thread::sleep(sleep_duration - std::time::Duration::from_millis(1));
+                                }
+                                while frame_start.elapsed() < target_duration {
+                                    std::hint::spin_loop();
+                                }
+                            }
+                        }
 
                         window.request_redraw();
                     }

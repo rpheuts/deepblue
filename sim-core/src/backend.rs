@@ -164,14 +164,14 @@ impl SimulationBackend for CpuSimulator {
         if self.stream_inflow_active {
             let width = self.grid.descriptor.grid_res_x as i32;
             let height = self.grid.descriptor.grid_res_y as i32;
-            let inflow_x_center = width / 2;
-            let inflow_radius = (width as f32 * 0.03).max(3.0) as i32;
-            let inflow_y_end = (height as f32 * 0.04).max(4.0) as i32;
+            let inflow_x_center = (width as f32 * 0.54) as i32;
+            let inflow_radius = (width as f32 * 0.05).max(4.0) as i32;
+            let inflow_y_end = (height as f32 * 0.05).max(6.0) as i32;
             for y in 1..=inflow_y_end {
                 for x in (inflow_x_center - inflow_radius)..=(inflow_x_center + inflow_radius) {
                     let idx = self.grid.current.idx(x as u32, y as u32);
                     let z = self.grid.current.z_bed[idx];
-                    let target_h = (2.6 - z).max(0.6);
+                    let target_h = (2.6 - z).max(0.65);
                     if self.grid.current.h[idx] < target_h {
                         self.grid.current.h[idx] = target_h;
                     }

@@ -363,13 +363,13 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         v_next = raw_v * friction_factor;
     }
  
-    // Stream source injection (top center)
+    // Stream source injection (top center / river gorge head)
     if (params.stream_inflow_active > 0.5) {
-        let inflow_x_center = i32(width / 2u);
-        let inflow_radius = max(3, i32(f32(width) * 0.03));
-        let inflow_y_end = max(4, i32(f32(height) * 0.04));
+        let inflow_x_center = i32(f32(width) * 0.54);
+        let inflow_radius = max(4, i32(f32(width) * 0.05));
+        let inflow_y_end = max(6, i32(f32(height) * 0.05));
         if (y >= 1u && i32(y) <= inflow_y_end && abs(i32(x) - inflow_x_center) <= inflow_radius) {
-            let target_h = max(0.6, 2.6 - z_c);
+            let target_h = max(0.65, 2.6 - z_c);
             if (h_next < target_h) {
                 h_next = target_h;
             }

@@ -159,4 +159,12 @@ impl WgpuSimulator {
     pub fn sed_sat_texture(&self) -> &wgpu::Texture {
         &self.tex_sed_sat
     }
+
+    pub fn set_stream_inflow(&mut self, active: bool) {
+        self.stream_inflow_active = active;
+    }
+
+    pub fn set_coastal_sink(&mut self, active: bool) {
+        self.coastal_sink_active = active;
+    }
 }

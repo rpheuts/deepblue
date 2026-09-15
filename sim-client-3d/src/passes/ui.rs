@@ -30,6 +30,25 @@ pub enum SelectedScenario {
     MeanderingRiver,
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum FpsLimit {
+    Limit30,
+    Limit60,
+    Limit120,
+    Unlimited,
+}
+
+impl FpsLimit {
+    pub fn target_fps(&self) -> Option<u32> {
+        match self {
+            FpsLimit::Limit30 => Some(30),
+            FpsLimit::Limit60 => Some(60),
+            FpsLimit::Limit120 => Some(120),
+            FpsLimit::Unlimited => None,
+        }
+    }
+}
+
 pub struct UiState {
     pub active_tool: ActiveTool,
     pub brush_radius: f32,
@@ -46,6 +65,13 @@ pub struct UiState {
     pub wind_turbulence: f32,
     pub wind_shelter: f32,
     pub caustics_intensity: f32,
+
+    // Hydraulic conduits (Stream Inflow & Coastal Sink)
+    pub stream_inflow_enabled: bool,
+    pub coastal_sink_enabled: bool,
+
+    // Frame pacing / FPS limit
+    pub fps_limit: FpsLimit,
 
     // Telemetry
     pub fps: f32,
@@ -71,11 +97,14 @@ impl Default for UiState {
             wind_turbulence: 0.45,
             wind_shelter: 0.70,
             caustics_intensity: 1.25,
+            stream_inflow_enabled: true,
+            coastal_sink_enabled: true,
+            fps_limit: FpsLimit::Limit60,
             fps: 0.0,
             frame_time_ms: 0.0,
             sim_tick_ms: 0.0,
             grid_res: (1024, 1024),
-            camera_mode_name: "Perspective (3D Orbit)",
+            camera_mode_name: "Perspective (Orbit)",
         }
     }
 }
@@ -150,6 +179,13 @@ impl UiPass {
                     ui.label(format!("Sim Tick: {:.2} ms", state.sim_tick_ms));
                 });
                 ui.label(format!("Camera Mode: {}", state.camera_mode_name));
+                ui.horizontal(|ui| {
+                    ui.label("FPS Limit:");
+                    ui.selectable_value(&mut state.fps_limit, FpsLimit::Limit30, "30");
+                    ui.selectable_value(&mut state.fps_limit, FpsLimit::Limit60, "60");
+                    ui.selectable_value(&mut state.fps_limit, FpsLimit::Limit120, "120");
+                    ui.selectable_value(&mut state.fps_limit, FpsLimit::Unlimited, "Unlimited");
+                });
                 ui.separator();
 
                 // Scenario Selector
@@ -186,6 +222,14 @@ impl UiPass {
                     }
                 });
                 ui.add(egui::Slider::new(&mut state.sim_speed, 0.25..=4.0).text("Sim Speed Multiplier"));
+                if state.selected_scenario == SelectedScenario::MeanderingRiver {
+                    ui.separator();
+                    ui.label("🏞 River Hydraulics:");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut state.stream_inflow_enabled, "Continuous Inflow (North)");
+                        ui.checkbox(&mut state.coastal_sink_enabled, "Ocean Sink (South)");
+                    });
+                }
 
                 ui.separator();
 

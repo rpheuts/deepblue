@@ -277,6 +277,100 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     return out;
 }
 
+// 2D Hash function for fast procedural noise
+fn hash21_sky(p: vec2<f32>) -> f32 {
+    var p3 = fract(vec3<f32>(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+// 2D Value noise with Hermite cubic interpolation
+fn noise2d_sky(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+
+    let a = hash21_sky(i + vec2<f32>(0.0, 0.0));
+    let b = hash21_sky(i + vec2<f32>(1.0, 0.0));
+    let c = hash21_sky(i + vec2<f32>(0.0, 1.0));
+    let d = hash21_sky(i + vec2<f32>(1.0, 1.0));
+
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+// Multi-octave Fractional Brownian Motion with irrational rotations
+fn cloud_fbm(p: vec2<f32>) -> f32 {
+    var v = 0.0;
+    var a = 0.52;
+    var pos = p;
+    for (var i = 0; i < 4; i = i + 1) {
+        v += a * noise2d_sky(pos);
+        pos = vec2<f32>(pos.x * 1.62 - pos.y * 1.21, pos.x * 1.21 + pos.y * 1.62) + vec2<f32>(1.7, 3.1);
+        a *= 0.48;
+    }
+    return v;
+}
+
+// Evaluates the procedural sky dome, sun disc, corona, and dynamic drifting clouds
+fn evaluate_sky(
+    d: vec3<f32>,
+    time: f32,
+    sun_dir: vec3<f32>,
+    wind: vec4<f32>,
+) -> vec3<f32> {
+    let sky_up = max(d.z, 0.0);
+    let horizon_blend = smoothstep(0.005, 0.12, d.z);
+
+    // 1. Sky Dome Gradient (warm coastal horizon to rich cerulean zenith)
+    let horizon_color = vec3<f32>(0.76, 0.84, 0.94);
+    let zenith_color = vec3<f32>(0.18, 0.40, 0.76);
+    let sky_dome = mix(horizon_color, zenith_color, pow(sky_up, 0.50));
+
+    // 2. Sun Disc & Solar Corona
+    let sun_dot = max(dot(d, sun_dir), 0.0);
+    let sun_disc = pow(sun_dot, 512.0) * 4.0;
+    let sun_corona = pow(sun_dot, 28.0) * 0.40 * vec3<f32>(1.0, 0.96, 0.88);
+    let sun_glow = pow(sun_dot, 5.0) * 0.20 * vec3<f32>(1.0, 0.88, 0.72);
+    let sky_with_sun = sky_dome + vec3<f32>(1.0, 0.98, 0.92) * sun_disc + sun_corona + sun_glow;
+
+    // 3. Procedural Cumulus Cloud Deck
+    let cloud_dist = 1.0 / (sky_up + 0.14);
+    let wind_speed = max(wind.z, 2.5);
+    let wind_drift = wind.xy * (time * 0.006 * wind_speed);
+    let cloud_uv = d.xy * cloud_dist * 0.28 + wind_drift;
+
+    let cloud_raw = cloud_fbm(cloud_uv);
+
+    // Soft cumulus billows with realistic clear sky breaks
+    let coverage = 0.42;
+    let cloud_density = smoothstep(coverage, coverage + 0.30, cloud_raw) * horizon_blend;
+
+    // Self-shadowing from sun direction
+    let sun_cloud_offset = normalize(sun_dir.xy) * 0.035;
+    let cloud_sun_sample = cloud_fbm(cloud_uv + sun_cloud_offset);
+    let self_shadow = clamp((cloud_sun_sample - cloud_raw) * 2.5, -0.3, 0.5);
+
+    // Shaded base vs silver sunlit crests
+    let cloud_shaded = vec3<f32>(0.66, 0.72, 0.82);
+    let cloud_lit = vec3<f32>(1.0, 0.99, 0.98);
+    var cloud_color = mix(cloud_lit, cloud_shaded, self_shadow + (1.0 - cloud_raw) * 0.35);
+
+    // Forward Mie scattering (silver lining near sun)
+    let silver_lining = pow(sun_dot, 10.0) * 0.80 * smoothstep(0.1, 0.7, cloud_raw);
+    cloud_color += vec3<f32>(1.0, 0.96, 0.85) * silver_lining;
+
+    var final_sky = mix(sky_with_sun, cloud_color, cloud_density * 0.90);
+
+    // Below-horizon fade
+    if (d.z <= 0.0) {
+        let below_horizon_fade = clamp(-d.z * 3.5, 0.0, 1.0);
+        let sea_ambient = vec3<f32>(0.07, 0.12, 0.22);
+        final_sky = mix(horizon_color, sea_ambient, below_horizon_fade);
+    }
+
+    return final_sky;
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let uv = in.uv;
@@ -311,15 +405,36 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let gerstner = calc_gerstner(in.world_pos.xy, camera.time, camera.wind, camera.wind_turb, shelter);
     let wave_weight = smoothstep(0.006, 0.06, depth);
 
-    let total_nx = -(deta_x * 2.5) + gerstner.normal_offset.x * wave_weight * 1.5;
-    let total_ny = -(deta_y * 2.5) + gerstner.normal_offset.y * wave_weight * 1.5;
-    let normal = normalize(vec3<f32>(total_nx, total_ny, 1.0));
-
-    // Flow velocity for animated foam advection
+    // Flow velocity for foam advection and flow-map normal perturbation
     let vel_data = textureSample(tex_velocity, samp, uv);
     let u = vel_data.r;
     let v = vel_data.g;
     let speed = sqrt(u * u + v * v);
+
+    // Flow-map driven normal perturbation: simulation velocity distorts micro-normals
+    // Valve two-phase cycling prevents texture drift accumulation
+    let flow_dir = vec2<f32>(u, v);
+    let flow_speed = length(flow_dir);
+    let flow_norm = select(vec2<f32>(0.0, 0.0), flow_dir / flow_speed, flow_speed > 0.01);
+    let phase0 = fract(camera.time * 0.15);
+    let phase1 = fract(camera.time * 0.15 + 0.5);
+    let blend_t = abs(2.0 * phase0 - 1.0);
+    let flow_scale = clamp(flow_speed * 0.12, 0.0, 0.8);
+    let uv_flow0 = in.world_pos.xy * 0.8 + flow_norm * phase0 * flow_scale;
+    let uv_flow1 = in.world_pos.xy * 0.8 + flow_norm * phase1 * flow_scale;
+    let fn0 = vec2<f32>(
+        sin(uv_flow0.x * 12.0 + cos(uv_flow0.y * 9.0)),
+        cos(uv_flow0.y * 11.0 + sin(uv_flow0.x * 8.0))
+    ) * 0.15;
+    let fn1 = vec2<f32>(
+        sin(uv_flow1.x * 12.0 + cos(uv_flow1.y * 9.0)),
+        cos(uv_flow1.y * 11.0 + sin(uv_flow1.x * 8.0))
+    ) * 0.15;
+    let flow_normal_offset = mix(fn0, fn1, blend_t) * flow_scale;
+
+    let total_nx = -(deta_x * 2.5) + gerstner.normal_offset.x * wave_weight * 1.5 + flow_normal_offset.x;
+    let total_ny = -(deta_y * 2.5) + gerstner.normal_offset.y * wave_weight * 1.5 + flow_normal_offset.y;
+    let normal = normalize(vec3<f32>(total_nx, total_ny, 1.0));
 
     // A. Physical Beer-Lambert Optical Extinction
     let t_r = exp(-4.2 * depth);
@@ -346,8 +461,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let n_dot_v = max(dot(normal, view_dir), 0.0);
     let fresnel = 0.03 + 0.97 * pow(1.0 - n_dot_v, 4.0);
 
-    let sky_color = vec3<f32>(0.65, 0.82, 0.98);
-    water_color = mix(water_color, sky_color, fresnel * 0.55);
+    // Procedural sky dome & dynamic drifting clouds reflection
+    let reflect_dir = reflect(-view_dir, normal);
+    let reflected_sky = evaluate_sky(reflect_dir, camera.time, sun_dir, camera.wind);
+    water_color = mix(water_color, reflected_sky, fresnel * 0.70);
 
     // Specular Sun Glint (Blinn-Phong) across choppy wave facets
     let half_vec = normalize(sun_dir + view_dir);
@@ -355,23 +472,45 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let sun_glint = pow(n_dot_h, 48.0) * 2.2;
     water_color += vec3<f32>(1.0, 0.98, 0.88) * sun_glint;
 
-    // D. White Water Sea Foam (Rapids, Swash Breakers & Wind Whitecaps)
-    var foam = 0.0;
-    if (speed > 2.0) {
-        foam = clamp((speed - 2.0) / 2.0, 0.0, 0.85);
-    }
-    if (depth < 0.06 && v < -0.08) {
-        foam = max(foam, clamp((-v - 0.08) / 0.35, 0.0, 0.75));
-    }
-    // Wind chop whitecaps on steep wave crests
-    if (gerstner.displacement.z > 0.045 && depth > 0.25) {
-        let chop_foam = clamp((gerstner.displacement.z - 0.045) / 0.035, 0.0, 0.65);
-        foam = max(foam, chop_foam);
+    // E. Subsurface Scattering — translucent wave crest glow
+    let sss_sun_through = max(dot(-sun_dir, view_dir), 0.0);
+    let sss_depth_mask = exp(-8.0 * depth);
+    let sss_wave_crest = max(gerstner.displacement.z * wave_weight, 0.0) * 6.0;
+    let sss_intensity = pow(sss_sun_through, 3.0) * sss_depth_mask * sss_wave_crest;
+    let sss_color = vec3<f32>(0.10, 0.75, 0.65);
+    water_color += sss_color * sss_intensity * 0.8;
+
+    // F. White Water Sea Foam (Rapids, Swash Breakers & Wind Whitecaps)
+    let rapids_foam = clamp((speed - 1.8) / 2.5, 0.0, 1.0);
+    let swash_foam = select(0.0, clamp((-v - 0.06) / 0.40, 0.0, 0.9), depth < 0.08 && v < -0.06);
+    let whitecap_foam = select(0.0, clamp((gerstner.displacement.z - 0.04) / 0.03, 0.0, 0.7), depth > 0.2);
+    var foam = max(rapids_foam, max(swash_foam, whitecap_foam));
+
+    // Cellular foam dissolution texture
+    if (foam > 0.01) {
+        let foam_uv = in.world_pos.xy * 8.0 + vec2<f32>(u, v) * camera.time * 0.3;
+        let cell1 = sin(foam_uv.x * 7.3 + foam_uv.y * 5.1 + camera.time * 2.0);
+        let cell2 = cos(foam_uv.x * 11.7 - foam_uv.y * 8.3 - camera.time * 1.5);
+        let cell_pattern = smoothstep(0.2, 0.8, cell1 * cell1 + cell2 * cell2);
+        foam = foam * mix(0.5, 1.0, cell_pattern);
     }
 
-    let foam_color = vec3<f32>(0.96, 0.98, 1.0);
-    let final_color = mix(water_color, foam_color, foam);
-    let alpha = clamp(0.55 + depth * 0.85 + foam * 0.45, 0.45, 0.96) * smoothstep(0.004, 0.015, depth);
+    // Foam catches specular highlights
+    let foam_spec = pow(n_dot_h, 12.0) * foam * 0.4;
+    let foam_color = vec3<f32>(0.96, 0.98, 1.0) + vec3<f32>(1.0, 0.98, 0.90) * foam_spec;
+    var final_color = mix(water_color, foam_color, foam);
+
+    // Atmospheric depth haze
+    let cam_dist = length(camera.camera_pos.xyz - in.world_pos);
+    let haze = 1.0 - exp(-cam_dist * cam_dist * 0.00003);
+    let haze_color = vec3<f32>(0.72, 0.80, 0.92);
+    final_color = mix(final_color, haze_color, haze * 0.6);
+
+    // Depth-dependent alpha with ultra-soft shoreline blend
+    let shore_fade = smoothstep(0.003, 0.025, depth);
+    let depth_opacity = 0.40 + 0.55 * (1.0 - exp(-3.5 * depth));
+    let foam_opacity = foam * 0.50;
+    let alpha = clamp(depth_opacity + foam_opacity, 0.0, 0.97) * shore_fade;
 
     return vec4<f32>(final_color, alpha);
 }

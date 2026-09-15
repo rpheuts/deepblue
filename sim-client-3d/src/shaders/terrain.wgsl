@@ -152,30 +152,60 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Slope calculation
     let slope = sqrt(dz_dx * dz_dx + dz_dy * dz_dy);
 
-    // Material Albedo Splatting
+    // Material Albedo with Procedural Sand Grain Texture
     var albedo: vec3<f32>;
+    var roughness: f32;
+
     if (is_stone > 0.5) {
         // Indestructible stone breakwater / masonry granite
         albedo = vec3<f32>(0.46, 0.49, 0.53);
+        roughness = 0.75;
     } else if (slope > 0.65) {
         // Steep canyon bedrock
         albedo = vec3<f32>(0.58, 0.52, 0.46);
+        roughness = 0.85;
     } else {
-        // Golden beach sand
-        albedo = vec3<f32>(0.84, 0.74, 0.54);
+        // Multi-frequency sand grain noise for visible texture
+        let grain_uv = in.world_pos.xy;
+        let grain1 = sin(grain_uv.x * 85.0 + grain_uv.y * 73.0) * 0.03;
+        let grain2 = sin(grain_uv.x * 127.0 - grain_uv.y * 91.0) * 0.02;
+        let grain3 = sin(grain_uv.x * 203.0 + grain_uv.y * 167.0) * 0.015;
+        let grain_variation = grain1 + grain2 + grain3;
+
+        // Base golden sand with natural warm/cool variation
+        let sand_base = vec3<f32>(0.84, 0.74, 0.54);
+        let sand_warm = vec3<f32>(0.88, 0.72, 0.48);
+        let patch_blend = sin(grain_uv.x * 3.2 + grain_uv.y * 2.7) * 0.5 + 0.5;
+        albedo = mix(sand_base, sand_warm, patch_blend * 0.25) + grain_variation;
+        roughness = 0.92;
     }
 
-    // Moisture darkening: wet sand darkens naturally
-    let moisture_factor = 1.0 - 0.32 * sat;
+    // Moisture: darkens albedo AND dramatically reduces roughness (wet sand = mirror-smooth)
+    let moisture_factor = 1.0 - 0.40 * sat;
     albedo = albedo * moisture_factor;
+    roughness = mix(roughness, 0.15, sat * sat);
 
-    // Directional sunlight + ambient sky lighting
+    // GGX Microfacet Specular BRDF (energy-conserving PBR lighting)
     let sun_dir = normalize(camera.sun_dir.xyz);
+    let view_dir = normalize(camera.camera_pos.xyz - in.world_pos);
+    let half_vec = normalize(sun_dir + view_dir);
     let n_dot_l = max(dot(normal, sun_dir), 0.0);
+    let n_dot_v = max(dot(normal, view_dir), 0.0);
+    let n_dot_h = max(dot(normal, half_vec), 0.0);
+
+    let alpha_r = roughness * roughness;
+    let alpha2 = alpha_r * alpha_r;
+    let denom = n_dot_h * n_dot_h * (alpha2 - 1.0) + 1.0;
+    let ggx_d = alpha2 / (3.14159 * denom * denom);
+
+    let f0 = select(0.04, 0.12, sat > 0.5);
+    let fresnel_terrain = f0 + (1.0 - f0) * pow(1.0 - max(dot(half_vec, view_dir), 0.0), 5.0);
+    let specular = ggx_d * fresnel_terrain * n_dot_l;
+
     let ambient = vec3<f32>(0.24, 0.30, 0.38);
     let sun_color = vec3<f32>(1.0, 0.96, 0.88);
 
-    var lit_color = albedo * (ambient + sun_color * n_dot_l);
+    var lit_color = albedo * (ambient + sun_color * n_dot_l) + sun_color * specular;
 
     // Sample water depth to evaluate underwater optics & dynamic caustics
     let water_sample = textureSample(tex_water, samp, uv);
@@ -223,16 +253,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
         let caustic_color = vec3<f32>(0.92, 0.98, 1.0) * sun_color;
         lit_color += caustic_color * caustic_intensity;
-    } else {
-        // C. Wet sand specular gloss ("Mirror Beach" on subaerial sand)
-        if (sat > 0.35 && is_stone < 0.5) {
-            let view_dir = normalize(camera.camera_pos.xyz - in.world_pos);
-            let half_vec = normalize(sun_dir + view_dir);
-            let n_dot_h = max(dot(normal, half_vec), 0.0);
-            let wet_spec = pow(n_dot_h, 32.0) * (sat - 0.35) * 1.5;
-            lit_color += vec3<f32>(0.9, 0.95, 1.0) * wet_spec;
-        }
     }
+
+    // Atmospheric depth haze
+    let cam_dist = length(camera.camera_pos.xyz - in.world_pos);
+    let haze = 1.0 - exp(-cam_dist * cam_dist * 0.00003);
+    let haze_color = vec3<f32>(0.72, 0.80, 0.92);
+    lit_color = mix(lit_color, haze_color, haze * 0.6);
 
     return vec4<f32>(lit_color, 1.0);
 }
