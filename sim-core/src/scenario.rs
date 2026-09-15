@@ -301,4 +301,145 @@ impl Scenarios {
         grid.apply_boundaries();
         grid
     }
+
+    /// Creates an amplified high-relief coastal scenario ("Beach 2"):
+    /// - Coastal dunes & bluffs rising up to +5.6 meters with natural wind-carved ridges.
+    /// - Deeper ocean basin plunging to -3.4 meters with ~4 meters of deep water.
+    /// - Massive incoming ocean swell with wave amplitude 1.25m (~2.5m peak-to-trough waves) and 1.45 m/s onshore surge.
+    /// - Formidable 3.2-meter stone breakwater / sea wall jetty.
+    /// - Epic fortified sandcastle citadel with 1.6m high curtain ramparts, 2.2m corner bastion towers,
+    ///   a 2.6m central keep citadel, and a 0.65m deep excavated moat.
+    pub fn beach2(desc: SimDomainDescriptor) -> DoubleBufferedGrid {
+        let mut grid = DoubleBufferedGrid::new(desc);
+        let width = desc.grid_res_x;
+        let height = desc.grid_res_y;
+
+        let wave_gen = EdgeBoundary::WaveGenerator {
+            base_elevation: 0.55,
+            wave_amplitude: 1.25,
+            wave_period: 22.0,
+            surge_speed: 1.45,
+            tide_amplitude: 0.28,
+            tide_period: 90.0,
+        };
+        grid.boundaries = DomainBoundaryConfig::coastal_waves(wave_gen);
+
+        let pi = std::f32::consts::PI;
+
+        // Sandcastle center and dimensions
+        let castle_cx = 0.52f32;
+        let castle_cy = 0.52f32;
+        let castle_hw = 0.095f32; // half-width in normalized units (~9.5 meters)
+
+        for y in 0..height {
+            let ny = y as f32 / height as f32; // 0.0 (North/dunes) to 1.0 (South/ocean)
+
+            for x in 0..width {
+                let nx = x as f32 / width as f32; // 0.0 (West) to 1.0 (East)
+                let idx = grid.current.idx(x, y);
+
+                // --- 1. Base Coastline Bathymetry & Amplified Elevation Profile ---
+                // Continuous C1 profile: High Coastal Bluffs & Dunes -> Steep Sandy Foreshore -> Deep Ocean Basin
+                let beach_slope = (2.60 - 0.40) / 0.32; // ~6.875 m/ny
+                let mut z = if ny < 0.33 {
+                    // Dunes & coastal bluffs (z = 2.60m at ny=0.33 up to 5.60m at ny=0.0)
+                    let u = (0.33 - ny) / 0.33;
+                    let curvature = 5.60 - 2.60 - beach_slope * 0.33;
+                    let dune_base = 2.60 + beach_slope * (0.33 - ny) + curvature * u * u;
+                    let dune_bumps = 0.25 * u * u * (nx * 6.0 * pi).sin() * (ny * 4.0 * pi).cos()
+                        + 0.15 * u * (nx * 12.0 * pi).cos();
+                    dune_base + dune_bumps
+                } else if ny < 0.65 {
+                    // Steeper sloping beach foreshore (z = 2.60m down to 0.40m)
+                    2.60 - beach_slope * (ny - 0.33)
+                } else {
+                    // Deep ocean basin (z = 0.40m at ny=0.65 smoothly descending to -3.40m at ny=1.0)
+                    let v = (ny - 0.65) / 0.35;
+                    let h00 = 1.0 - 3.0 * v * v + 2.0 * v * v * v;
+                    let h10 = v - 2.0 * v * v + v * v * v;
+                    let h01 = 3.0 * v * v - 2.0 * v * v * v;
+                    let shelf_base = 0.40 * h00 + (-3.40) * h01 + (-beach_slope * 0.35) * h10;
+                    let ocean_ripples = 0.06 * v * (nx * 8.0 * pi).cos();
+                    shelf_base + ocean_ripples
+                };
+
+                // Natural sand ripples in the foreshore / swash zone
+                let swash_window = ((ny - 0.25) / 0.12).clamp(0.0, 1.0) * ((0.80 - ny) / 0.15).clamp(0.0, 1.0);
+                z += 0.04 * swash_window * (nx * 8.0 * pi + ny * 6.0 * pi).sin();
+
+                // Default bedrock limit: 0.70m below sand surface, or deep in seabed
+                let mut bedrock = (z - 0.70).max(-4.5);
+
+                // --- 2. Pre-Built Massive Stone Breakwater / Sea Wall Jetty (West Flank) ---
+                // Extends from ny = 0.30 down to ny = 0.76, width ~ 4.4 meters
+                let jetty_x = 0.22f32;
+                let jetty_half_w = 0.022f32;
+                if (nx - jetty_x).abs() <= jetty_half_w && (0.30..=0.76).contains(&ny) {
+                    let stone_height = 3.20f32;
+                    z = z.max(stone_height);
+                    bedrock = z; // Indestructible stone masonry
+                }
+
+                // --- 3. Pre-Built Epic Fortified Sandcastle (Center Swash Zone) ---
+                let dx_c = (nx - castle_cx).abs();
+                let dy_c = (ny - castle_cy).abs();
+                let d_box = dx_c.max(dy_c);
+
+                if d_box < castle_hw + 0.040 {
+                    let base_beach_z = z;
+                    // Erodible sand layer
+                    bedrock = (base_beach_z - 0.50).max(-0.5);
+
+                    // A. Deep Moat: channels rushing surf around citadel
+                    if d_box >= castle_hw - 0.010 && d_box <= castle_hw + 0.030 {
+                        let moat_depth = 0.65f32;
+                        z = (base_beach_z - moat_depth).max(bedrock + 0.05);
+                    }
+                    // B. Outer Curtain Ramparts: tall sand embankment (+1.60m)
+                    else if d_box >= castle_hw - 0.038 && d_box < castle_hw - 0.010 {
+                        let wall_h = 1.60f32;
+                        z = base_beach_z + wall_h;
+                    }
+                    // C. Inner Courtyard & Central Keep Tower (+2.60m)
+                    else if d_box < castle_hw - 0.038 {
+                        let dist_center = (dx_c * dx_c + dy_c * dy_c).sqrt();
+                        if dist_center < 0.024 {
+                            z = base_beach_z + 2.60f32;
+                        } else {
+                            z = base_beach_z + 0.50f32;
+                        }
+                    }
+
+                    // D. Four Reinforced Corner Bastion Towers (+2.20m)
+                    let corner_dist = ((dx_c - (castle_hw - 0.024)).powi(2) + (dy_c - (castle_hw - 0.024)).powi(2)).sqrt();
+                    if corner_dist < 0.024 {
+                        let tower_h = 2.20f32;
+                        z = z.max(base_beach_z + tower_h);
+                    }
+                }
+
+                grid.current.z_bed[idx] = z;
+                grid.next.z_bed[idx] = z;
+                grid.current.bedrock_z[idx] = bedrock;
+                grid.next.bedrock_z[idx] = bedrock;
+
+                // --- 4. Initial Water Level (Deep Ocean Pre-Fill) ---
+                let still_water_eta = 0.55f32;
+                if still_water_eta > z {
+                    let h = still_water_eta - z;
+                    grid.current.h[idx] = h;
+                    grid.next.h[idx] = h;
+                    grid.current.soil_sat[idx] = 1.0;
+                    grid.next.soil_sat[idx] = 1.0;
+                } else {
+                    let sat = 0.05 + 0.60 * ((ny - 0.28) / 0.35).clamp(0.0, 1.0).powf(1.5);
+                    grid.current.soil_sat[idx] = sat;
+                    grid.next.soil_sat[idx] = sat;
+                }
+            }
+        }
+
+        grid.apply_boundaries();
+        grid
+    }
 }

@@ -2,9 +2,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use glam::Vec2;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, Event, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{Event, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
-use winit::keyboard::{Key, NamedKey};
 use winit::window::WindowBuilder;
 
 use sim_core::domain::SimDomainDescriptor;
@@ -13,12 +12,14 @@ use sim_backend::WgpuSimulator;
 
 mod camera;
 mod context;
+mod input;
 mod mesh;
 mod passes;
 mod raycast;
 
-use camera::{Camera, CameraMode};
+use camera::Camera;
 use context::RenderContext;
+use input::InputState;
 use mesh::{GridMesh, SkirtMesh};
 use passes::{ActiveTool, DecalPass, SelectedScenario, SkirtPass, TerrainPass, UiPass, UiState, WaterPass};
 use raycast::HeightfieldRaycaster;
@@ -46,7 +47,7 @@ fn main() {
         grid_res_y: domain_res,
         world_origin: [0.0, 0.0, 0.0],
     };
-    let initial_grid = Scenarios::beach_sandcastle_waves(desc);
+    let initial_grid = Scenarios::beach2(desc);
 
     let mut sim = WgpuSimulator::from_device(context.device.clone(), context.queue.clone(), initial_grid);
 
@@ -85,6 +86,7 @@ fn main() {
     let mut terrain_bg = terrain_pass.create_bind_group(
         &context.device,
         sim.elevation_view(),
+        sim.water_view(),
         sim.sed_sat_view(),
         &context.sampler_linear,
     );
@@ -107,30 +109,23 @@ fn main() {
         &context.sampler_linear,
     );
 
-    // 5. Camera & UI Controller State
+    // 5. Camera, Input, & UI Controller State
     let mut camera = Camera::new(desc.extent_x, desc.extent_y);
+    let mut input = InputState::new();
     let mut ui_state = UiState::default();
     ui_state.grid_res = (desc.grid_res_x, desc.grid_res_y);
-
-    let mut cursor_screen_pos = Vec2::ZERO;
-    let mut cursor_in_window = false;
-    let mut is_right_down = false;
-    let mut is_left_down = false;
-    let mut is_shift_down = false;
-    let mut is_ctrl_down = false;
-    let mut last_mouse_pos = Vec2::ZERO;
 
     let start_time = Instant::now();
     let mut last_frame_time = Instant::now();
     let mut frame_count = 0u32;
     let mut fps_timer = Instant::now();
+    let mut sim_accumulator = 0.0f32;
 
     event_loop.set_control_flow(ControlFlow::Poll);
 
     let _ = event_loop.run(move |event, target| {
         match event {
             Event::WindowEvent { event, window_id } if window_id == window.id() => {
-                // Let egui inspect event first
                 let consumed = ui_pass.handle_event(&window, &event);
 
                 match event {
@@ -143,95 +138,12 @@ fn main() {
                         camera.aspect = (physical_size.width as f32) / (physical_size.height as f32).max(1.0);
                     }
 
-                    WindowEvent::CursorMoved { position, .. } => {
-                        cursor_screen_pos = Vec2::new(position.x as f32, position.y as f32);
-                        cursor_in_window = true;
-
-                        if !consumed {
-                            let delta = cursor_screen_pos - last_mouse_pos;
-                            if is_right_down {
-                                if is_shift_down {
-                                    camera.pan(delta.x, delta.y);
-                                } else {
-                                    camera.orbit(-delta.x * 0.006, delta.y * 0.006);
-                                }
-                            }
-                        }
-                        last_mouse_pos = cursor_screen_pos;
-                    }
-
-                    WindowEvent::CursorLeft { .. } => {
-                        cursor_in_window = false;
-                    }
-
-                    WindowEvent::MouseWheel { delta, .. } => {
-                        if !consumed {
-                            let scroll_amount = match delta {
-                                MouseScrollDelta::LineDelta(_, y) => y,
-                                MouseScrollDelta::PixelDelta(pos) => (pos.y as f32) * 0.05,
-                            };
-                            camera.zoom(scroll_amount);
-                        }
-                    }
-
-                    WindowEvent::MouseInput { state, button, .. } => {
-                        let pressed = state == ElementState::Pressed;
-                        match button {
-                            MouseButton::Left => {
-                                if !consumed {
-                                    is_left_down = pressed;
-                                } else if !pressed {
-                                    is_left_down = false;
-                                }
-                            }
-                            MouseButton::Right => {
-                                is_right_down = pressed;
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    WindowEvent::KeyboardInput {
-                        event:
-                            KeyEvent {
-                                logical_key,
-                                state,
-                                ..
-                            },
-                        ..
-                    } => {
-                        let pressed = state == ElementState::Pressed;
-                        match logical_key {
-                            Key::Named(NamedKey::Shift) => is_shift_down = pressed,
-                            Key::Named(NamedKey::Control) => is_ctrl_down = pressed,
-                            Key::Named(NamedKey::Tab) if pressed => {
-                                camera.toggle_mode();
-                                ui_state.camera_mode_name = match camera.mode {
-                                    CameraMode::Perspective => "Perspective (3D Orbit)",
-                                    CameraMode::Isometric => "2.5D True Isometric",
-                                };
-                            }
-                            Key::Named(NamedKey::Space) if pressed => {
-                                ui_state.is_paused = !ui_state.is_paused;
-                            }
-                            Key::Character(c) if pressed => match c.as_str() {
-                                "r" | "R" => camera.reset(desc.extent_x, desc.extent_y),
-                                "1" => ui_state.active_tool = ActiveTool::Water,
-                                "2" => ui_state.active_tool = ActiveTool::SandDam,
-                                "3" => ui_state.active_tool = ActiveTool::StoneBreakwater,
-                                "4" => ui_state.active_tool = ActiveTool::Dig,
-                                _ => {}
-                            },
-                            _ => {}
-                        }
-                    }
-
                     WindowEvent::RedrawRequested => {
                         let now = Instant::now();
-                        let dt_frame = now.duration_since(last_frame_time).as_secs_f32();
+                        let dt_frame = now.duration_since(last_frame_time).as_secs_f32().min(0.10);
                         last_frame_time = now;
 
-                        // Telemetry update (1 Hz)
+                        // Telemetry update (2 Hz)
                         frame_count += 1;
                         if fps_timer.elapsed().as_secs_f32() >= 0.5 {
                             ui_state.fps = (frame_count as f32) / fps_timer.elapsed().as_secs_f32();
@@ -244,6 +156,7 @@ fn main() {
                         if ui_state.trigger_scenario_reset {
                             ui_state.trigger_scenario_reset = false;
                             let new_grid = match ui_state.selected_scenario {
+                                SelectedScenario::Beach2 => Scenarios::beach2(desc),
                                 SelectedScenario::BeachSandcastleWaves => Scenarios::beach_sandcastle_waves(desc),
                                 SelectedScenario::DamBreak => Scenarios::dam_break(desc),
                                 SelectedScenario::MeanderingRiver => Scenarios::beach_stream(desc),
@@ -252,6 +165,7 @@ fn main() {
                             terrain_bg = terrain_pass.create_bind_group(
                                 &context.device,
                                 sim.elevation_view(),
+                                sim.water_view(),
                                 sim.sed_sat_view(),
                                 &context.sampler_linear,
                             );
@@ -275,18 +189,33 @@ fn main() {
                             );
                         }
 
-                        // Simulation Tick (Zero-Copy on GPU)
+                        // Simulation Tick (Fixed-Timestep Accumulator for Temporal Decoupling)
                         if !ui_state.is_paused {
+                            let wind_dir = ui_state.wind_dir();
+                            sim.set_wind_full(
+                                ui_state.wind_speed,
+                                wind_dir[0],
+                                wind_dir[1],
+                                ui_state.wind_turbulence,
+                                ui_state.wind_shelter,
+                            );
+
                             let sim_start = Instant::now();
-                            let sim_step_dt = 0.016 * ui_state.sim_speed;
-                            sim.step_subdivided(sim_step_dt, 0.004);
+                            sim_accumulator += dt_frame * ui_state.sim_speed;
+                            let fixed_dt = 1.0 / 60.0;
+                            let mut steps = 0;
+                            while sim_accumulator >= fixed_dt && steps < 4 {
+                                sim.step_subdivided(fixed_dt, 0.004);
+                                sim_accumulator -= fixed_dt;
+                                steps += 1;
+                            }
                             ui_state.sim_tick_ms = sim_start.elapsed().as_secs_f32() * 1000.0;
                         }
 
                         // 3D Terrain Raycasting & Tool Interaction
                         let screen_size = Vec2::new(context.config.width as f32, context.config.height as f32);
-                        let (ray_origin, ray_dir) = camera.screen_to_ray(cursor_screen_pos, screen_size);
-                        let hit_pos = if cursor_in_window {
+                        let (ray_origin, ray_dir) = camera.screen_to_ray(input.cursor_screen_pos, screen_size);
+                        let hit_pos = if input.cursor_in_window {
                             HeightfieldRaycaster::intersect(
                                 ray_origin,
                                 ray_dir,
@@ -300,7 +229,7 @@ fn main() {
                             None
                         };
 
-                        // Update Decal Brush Ring
+                        // Update Decal Brush Ring & Apply Active Tool
                         if let Some(hit) = hit_pos {
                             decal_pass.update(
                                 &context.queue,
@@ -311,20 +240,11 @@ fn main() {
                                 ui_state.active_tool.color(),
                             );
 
-                            // Apply Active Tool when Left Mouse is held
-                            if is_left_down {
-                                let norm_x = hit.x / desc.extent_x;
-                                let norm_y = hit.y / desc.extent_y;
-                                let gx = (norm_x * (desc.grid_res_x - 1) as f32).round() as i32;
-                                let gy = (norm_y * (desc.grid_res_y - 1) as f32).round() as i32;
-
-                                let radius_cells = ((ui_state.brush_radius / desc.extent_x) * (desc.grid_res_x as f32)).round().max(1.0) as i32;
-                                let r2 = radius_cells * radius_cells;
-
+                            if input.is_left_down {
                                 let strength = ui_state.brush_strength;
-                                let tool = if is_ctrl_down {
+                                let tool = if input.is_ctrl_down {
                                     ActiveTool::StoneBreakwater
-                                } else if is_shift_down {
+                                } else if input.is_shift_down {
                                     ActiveTool::SandDam
                                 } else {
                                     ui_state.active_tool
@@ -337,7 +257,7 @@ fn main() {
                                     ActiveTool::Dig => 4,
                                 };
 
-                                // Dispatch in-situ GPU compute brush (zero-copy, preserves living waves and velocities)
+                                // Dispatch in-situ GPU compute brush with automatic host mirror sync
                                 sim.apply_brush(
                                     hit.x,
                                     hit.y,
@@ -345,37 +265,6 @@ fn main() {
                                     strength,
                                     tool_type,
                                 );
-
-                                // Update local CPU bathymetry strictly for mouse raycasting reflection
-                                if tool != ActiveTool::Water {
-                                    for dy in -radius_cells..=radius_cells {
-                                        for dx in -radius_cells..=radius_cells {
-                                            let dist2 = dx * dx + dy * dy;
-                                            if dist2 <= r2 {
-                                                let px = (gx + dx).clamp(1, desc.grid_res_x as i32 - 2) as u32;
-                                                let py = (gy + dy).clamp(1, desc.grid_res_y as i32 - 2) as u32;
-                                                let idx = sim.cpu_grid.current.idx(px, py);
-                                                let falloff = 1.0 - (dist2 as f32 / r2 as f32).sqrt();
-
-                                                match tool {
-                                                    ActiveTool::SandDam => {
-                                                        sim.cpu_grid.current.z_bed[idx] += strength * 0.15 * falloff;
-                                                    }
-                                                    ActiveTool::StoneBreakwater => {
-                                                        sim.cpu_grid.current.z_bed[idx] += strength * 0.20 * falloff;
-                                                        sim.cpu_grid.current.bedrock_z[idx] = sim.cpu_grid.current.z_bed[idx];
-                                                    }
-                                                    ActiveTool::Dig => {
-                                                        let cur_z = sim.cpu_grid.current.z_bed[idx];
-                                                        let bedrock = sim.cpu_grid.current.bedrock_z[idx];
-                                                        sim.cpu_grid.current.z_bed[idx] = (cur_z - strength * 0.20 * falloff).max(bedrock);
-                                                    }
-                                                    _ => {}
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
                             }
                         } else {
                             decal_pass.update(&context.queue, 0.0, 0.0, 1.0, false, [0.0; 4]);
@@ -383,7 +272,13 @@ fn main() {
 
                         // Update Camera Uniforms
                         let total_time = start_time.elapsed().as_secs_f32();
-                        let camera_uniforms = camera.create_uniforms(total_time, desc.extent_x, desc.extent_y);
+                        let camera_uniforms = camera.create_uniforms(
+                            total_time,
+                            desc.extent_x,
+                            desc.extent_y,
+                            ui_state.wind_uniform(),
+                            ui_state.wind_turb_uniform(),
+                        );
                         context.update_camera(&camera_uniforms);
 
                         // Build egui UI
@@ -468,7 +363,9 @@ fn main() {
                         window.request_redraw();
                     }
 
-                    _ => {}
+                    other_event => {
+                        input.handle_event(&other_event, consumed, &mut camera, &mut ui_state, &desc);
+                    }
                 }
             }
 

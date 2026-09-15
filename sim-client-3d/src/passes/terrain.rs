@@ -35,7 +35,7 @@ impl TerrainPass {
                     },
                     count: None,
                 },
-                // SedimentWetnessMap (Rgba32Float)
+                // WaterMap (Rgba32Float: h, eta, uh, vh) for caustics and underwater optics
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -46,9 +46,20 @@ impl TerrainPass {
                     },
                     count: None,
                 },
-                // Sampler
+                // SedimentWetnessMap (Rgba32Float)
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // Sampler
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
                     visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(if float32_filterable {
                         wgpu::SamplerBindingType::Filtering
@@ -115,6 +126,7 @@ impl TerrainPass {
         &self,
         device: &wgpu::Device,
         elevation_view: &wgpu::TextureView,
+        water_view: &wgpu::TextureView,
         sed_sat_view: &wgpu::TextureView,
         sampler: &wgpu::Sampler,
     ) -> wgpu::BindGroup {
@@ -128,10 +140,14 @@ impl TerrainPass {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(sed_sat_view),
+                    resource: wgpu::BindingResource::TextureView(water_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
+                    resource: wgpu::BindingResource::TextureView(sed_sat_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
                     resource: wgpu::BindingResource::Sampler(sampler),
                 },
             ],

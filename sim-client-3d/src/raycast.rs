@@ -14,8 +14,8 @@ impl HeightfieldRaycaster {
         grid_res_y: u32,
         z_bed: &[f32],
     ) -> Option<Vec3> {
-        let min_z = -1.0;
-        let max_z = 5.0;
+        let min_z = -5.0;
+        let max_z = 10.0;
 
         // Bounding box ray-AABB intersection
         let inv_d = Vec3::new(

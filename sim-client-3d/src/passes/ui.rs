@@ -25,6 +25,7 @@ impl ActiveTool {
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum SelectedScenario {
     BeachSandcastleWaves,
+    Beach2,
     DamBreak,
     MeanderingRiver,
 }
@@ -38,6 +39,14 @@ pub struct UiState {
     pub selected_scenario: SelectedScenario,
     pub trigger_scenario_reset: bool,
 
+    // Atmospheric wind & ocean sea state
+    pub wind_speed: f32,
+    pub wind_angle_deg: f32,
+    pub wave_chop_factor: f32,
+    pub wind_turbulence: f32,
+    pub wind_shelter: f32,
+    pub caustics_intensity: f32,
+
     // Telemetry
     pub fps: f32,
     pub frame_time_ms: f32,
@@ -50,18 +59,40 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             active_tool: ActiveTool::Water,
-            brush_radius: 1.2,
-            brush_strength: 0.15,
+            brush_radius: 1.8,
+            brush_strength: 0.25,
             is_paused: false,
             sim_speed: 1.0,
-            selected_scenario: SelectedScenario::BeachSandcastleWaves,
+            selected_scenario: SelectedScenario::Beach2,
             trigger_scenario_reset: false,
+            wind_speed: 9.0,
+            wind_angle_deg: 0.0,
+            wave_chop_factor: 1.0,
+            wind_turbulence: 0.45,
+            wind_shelter: 0.70,
+            caustics_intensity: 1.25,
             fps: 0.0,
             frame_time_ms: 0.0,
             sim_tick_ms: 0.0,
             grid_res: (1024, 1024),
             camera_mode_name: "Perspective (3D Orbit)",
         }
+    }
+}
+
+impl UiState {
+    pub fn wind_dir(&self) -> [f32; 2] {
+        let rad = self.wind_angle_deg.to_radians();
+        [rad.sin(), -rad.cos()]
+    }
+
+    pub fn wind_uniform(&self) -> [f32; 4] {
+        let dir = self.wind_dir();
+        [dir[0], dir[1], self.wind_speed, self.wave_chop_factor]
+    }
+
+    pub fn wind_turb_uniform(&self) -> [f32; 4] {
+        [self.wind_turbulence, self.wind_shelter, self.caustics_intensity, 0.0]
     }
 }
 
@@ -124,7 +155,11 @@ impl UiPass {
                 // Scenario Selector
                 ui.label("Scenario:");
                 ui.horizontal(|ui| {
-                    if ui.selectable_label(state.selected_scenario == SelectedScenario::BeachSandcastleWaves, "🏖 Beach Waves").clicked() {
+                    if ui.selectable_label(state.selected_scenario == SelectedScenario::Beach2, "🌊 Beach 2 (High Relief)").clicked() {
+                        state.selected_scenario = SelectedScenario::Beach2;
+                        state.trigger_scenario_reset = true;
+                    }
+                    if ui.selectable_label(state.selected_scenario == SelectedScenario::BeachSandcastleWaves, "🏖 Beach 1").clicked() {
                         state.selected_scenario = SelectedScenario::BeachSandcastleWaves;
                         state.trigger_scenario_reset = true;
                     }
@@ -165,8 +200,19 @@ impl UiPass {
                     ui.selectable_value(&mut state.active_tool, ActiveTool::Dig, "⛏ Dig [RMB]");
                 });
 
-                ui.add(egui::Slider::new(&mut state.brush_radius, 0.2..=5.0).text("Brush Radius (m)"));
-                ui.add(egui::Slider::new(&mut state.brush_strength, 0.01..=0.50).text("Strength / Flow"));
+                ui.add(egui::Slider::new(&mut state.brush_radius, 0.2..=8.0).text("Brush Radius (m)"));
+                ui.add(egui::Slider::new(&mut state.brush_strength, 0.01..=1.00).text("Strength / Flow"));
+
+                ui.separator();
+
+                // Atmospheric & Ocean Wind Controls
+                ui.heading("🌬 Wind & Ocean Sea State");
+                ui.add(egui::Slider::new(&mut state.wind_speed, 0.0..=25.0).text("Wind Speed (m/s)"));
+                ui.add(egui::Slider::new(&mut state.wind_angle_deg, 0.0..=360.0).text("Wind Heading (deg)"));
+                ui.add(egui::Slider::new(&mut state.wave_chop_factor, 0.0..=2.5).text("Wave Chop Scale"));
+                ui.add(egui::Slider::new(&mut state.wind_turbulence, 0.0..=1.0).text("Turbulence / Gusts"));
+                ui.add(egui::Slider::new(&mut state.wind_shelter, 0.0..=1.0).text("Terrain Sheltering (Lee)"));
+                ui.add(egui::Slider::new(&mut state.caustics_intensity, 0.0..=2.5).text("Caustics Intensity"));
 
                 ui.separator();
                 ui.collapsing("Navigation Shortcuts", |ui| {

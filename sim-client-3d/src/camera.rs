@@ -16,6 +16,8 @@ pub struct CameraUniforms {
     pub domain_extent: [f32; 2],
     pub time: f32,
     pub pad: f32,
+    pub wind: [f32; 4], // [dir_x, dir_y, speed, chop_factor]
+    pub wind_turb: [f32; 4], // [turbulence, shelter, caustics_boost, pad]
 }
 
 pub struct Camera {
@@ -141,7 +143,14 @@ impl Camera {
         (ray_origin, ray_dir)
     }
 
-    pub fn create_uniforms(&self, time: f32, domain_x: f32, domain_y: f32) -> CameraUniforms {
+    pub fn create_uniforms(
+        &self,
+        time: f32,
+        domain_x: f32,
+        domain_y: f32,
+        wind: [f32; 4],
+        wind_turb: [f32; 4],
+    ) -> CameraUniforms {
         let vp = self.view_proj_matrix();
         let inv_vp = vp.inverse();
         let pos = self.position();
@@ -157,6 +166,8 @@ impl Camera {
             domain_extent: [domain_x, domain_y],
             time,
             pad: 0.0,
+            wind,
+            wind_turb,
         }
     }
 }

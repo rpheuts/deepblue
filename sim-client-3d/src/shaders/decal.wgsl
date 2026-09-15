@@ -6,6 +6,8 @@ struct CameraUniforms {
     domain_extent: vec2<f32>,
     time: f32,
     pad: f32,
+    wind: vec4<f32>,
+    wind_turb: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;

@@ -34,6 +34,16 @@ struct StepParams {
     east_outflow_rate: f32,
     stream_inflow_active: f32,
     coastal_sink_active: f32,
+
+    wind_speed: f32,
+    wind_dir_x: f32,
+    wind_dir_y: f32,
+    wind_drag_coeff: f32,
+
+    wind_turbulence: f32,
+    wind_shelter: f32,
+    step_param_pad1: f32,
+    step_param_pad2: f32,
 }
 
 @group(0) @binding(0) var<uniform> domain: SimDomain;
@@ -67,6 +77,129 @@ fn calc_f(h: f32, u: f32, v: f32) -> vec3<f32> {
 
 fn calc_g(h: f32, u: f32, v: f32) -> vec3<f32> {
     return vec3<f32>(h * v, h * u * v, h * v * v + 0.5 * G * h * h);
+}
+
+fn calc_wind_turbulence(world_pos: vec2<f32>, time: f32, mean_dir: vec2<f32>, mean_speed: f32, turb_scale: f32) -> vec2<f32> {
+    if (turb_scale <= 0.001 || mean_speed <= 0.01) {
+        return mean_dir * mean_speed;
+    }
+    // Taylor's frozen turbulence hypothesis: advect eddies downwind at wind speed
+    let adv_pos = world_pos - mean_dir * (mean_speed * time * 0.65);
+
+    // Large-scale atmospheric gust intermittency envelope G(x, t) in [0.35, 1.50]
+    // Creates moving gust pockets ("cat's paws") separated by calm lulls
+    let env_arg1 = 0.045 * adv_pos.x + 0.038 * adv_pos.y;
+    let env_arg2 = 0.041 * adv_pos.y - 0.032 * adv_pos.x + 0.7;
+    let gust_raw = 0.5 + 0.5 * sin(env_arg1) * cos(env_arg2);
+    let gust_envelope = 0.35 + 1.15 * smoothstep(0.25, 0.75, gust_raw);
+
+    // Multi-rotor golden-ratio coordinate rotations: prevents repeating lattice patterns
+    // Rotor 1: theta1 = 0.65 rad (cos = 0.796, sin = 0.605)
+    let p1 = vec2<f32>(0.796 * adv_pos.x + 0.605 * adv_pos.y, -0.605 * adv_pos.x + 0.796 * adv_pos.y);
+    // Rotor 2: theta2 = 1.83 rad (cos = -0.255, sin = 0.967)
+    let p2 = vec2<f32>(-0.255 * adv_pos.x + 0.967 * adv_pos.y, -0.967 * adv_pos.x - 0.255 * adv_pos.y);
+    // Rotor 3: theta3 = 2.91 rad (cos = -0.974, sin = 0.228)
+    let p3 = vec2<f32>(-0.974 * adv_pos.x + 0.228 * adv_pos.y, -0.228 * adv_pos.x - 0.974 * adv_pos.y);
+
+    // Incommensurate frequencies: f1 = 0.11, f2 = 0.27, f3 = 0.68
+    let u1 = 0.11 * p1.x + cos(0.09 * p1.y);
+    let u2 = 0.27 * p2.x - 0.23 * p2.y + 1.4;
+    let u3 = 0.68 * p3.x + 0.54 * p3.y - 0.8;
+
+    // Derivatives for Rotor 1:
+    let du1_dp1x = 0.11;
+    let du1_dp1y = -0.09 * sin(0.09 * p1.y);
+    let du1_dx = du1_dp1x * 0.796 - du1_dp1y * 0.605;
+    let du1_dy = du1_dp1x * 0.605 + du1_dp1y * 0.796;
+
+    // Derivatives for Rotor 2:
+    let du2_dx = -0.2913;
+    let du2_dy = 0.2024;
+
+    // Derivatives for Rotor 3:
+    let du3_dx = -0.7854;
+    let du3_dy = -0.3709;
+
+    let dpsi_dx = cos(u1) * du1_dx + 0.55 * cos(u2) * du2_dx - 0.28 * sin(u3) * du3_dx;
+    let dpsi_dy = cos(u1) * du1_dy + 0.55 * cos(u2) * du2_dy - 0.28 * sin(u3) * du3_dy;
+
+    // Divergence-free curl noise: w' = (dpsi/dy, -dpsi/dx)
+    let curl_vec = vec2<f32>(dpsi_dy, -dpsi_dx);
+
+    // Modulate by the intermittent gust envelope
+    let effective_turb = turb_scale * gust_envelope * mean_speed * 0.75;
+    return mean_dir * mean_speed + curl_vec * effective_turb;
+}
+
+fn calc_orographic_shelter_swe(gx: u32, gy: u32, z_c: f32, dx: f32, turb_wind: vec2<f32>, shelter_strength: f32) -> f32 {
+    if (shelter_strength <= 0.001) {
+        return 1.0;
+    }
+    let turb_len = length(turb_wind);
+    if (turb_len <= 0.01) {
+        return 1.0;
+    }
+    // Look upwind along the local turbulent wind vector (dynamically meanders with gusts)
+    let upwind_dir = -turb_wind / turb_len;
+    let cell_size = max(dx, 0.01);
+
+    // 3-Ray Angular Wake Fan (+-15 degrees lateral spreading for conical wake)
+    let dir_c = upwind_dir;
+    let dir_l = vec2<f32>(upwind_dir.x * 0.966 - upwind_dir.y * 0.259, upwind_dir.x * 0.259 + upwind_dir.y * 0.966);
+    let dir_r = vec2<f32>(upwind_dir.x * 0.966 + upwind_dir.y * 0.259, -upwind_dir.x * 0.259 + upwind_dir.y * 0.966);
+
+    let max_gx = i32(domain.grid_res_x - 1u);
+    let max_gy = i32(domain.grid_res_y - 1u);
+    let pos = vec2<f32>(f32(gx), f32(gy));
+
+    // Sample distances: near (1.8m), mid (4.0m), far (7.5m)
+    let d1 = 1.8 / cell_size;
+    let d2 = 4.0 / cell_size;
+    let d3 = 7.5 / cell_size;
+
+    // Center ray sampling
+    let c1 = clamp(i32(round(pos.x + dir_c.x * d1)), 0, max_gx);
+    let c1y = clamp(i32(round(pos.y + dir_c.y * d1)), 0, max_gy);
+    let c2 = clamp(i32(round(pos.x + dir_c.x * d2)), 0, max_gx);
+    let c2y = clamp(i32(round(pos.y + dir_c.y * d2)), 0, max_gy);
+    let c3 = clamp(i32(round(pos.x + dir_c.x * d3)), 0, max_gx);
+    let c3y = clamp(i32(round(pos.y + dir_c.y * d3)), 0, max_gy);
+    let z_c1 = in_z[u32(c1y) * domain.grid_res_x + u32(c1)];
+    let z_c2 = in_z[u32(c2y) * domain.grid_res_x + u32(c2)];
+    let z_c3 = in_z[u32(c3y) * domain.grid_res_x + u32(c3)];
+    let dz_c = max(0.0, max(z_c1, max(z_c2, z_c3)) - z_c);
+
+    // Left flank ray sampling
+    let l1 = clamp(i32(round(pos.x + dir_l.x * d1)), 0, max_gx);
+    let l1y = clamp(i32(round(pos.y + dir_l.y * d1)), 0, max_gy);
+    let l2 = clamp(i32(round(pos.x + dir_l.x * d2)), 0, max_gx);
+    let l2y = clamp(i32(round(pos.y + dir_l.y * d2)), 0, max_gy);
+    let l3 = clamp(i32(round(pos.x + dir_l.x * d3)), 0, max_gx);
+    let l3y = clamp(i32(round(pos.y + dir_l.y * d3)), 0, max_gy);
+    let z_l1 = in_z[u32(l1y) * domain.grid_res_x + u32(l1)];
+    let z_l2 = in_z[u32(l2y) * domain.grid_res_x + u32(l2)];
+    let z_l3 = in_z[u32(l3y) * domain.grid_res_x + u32(l3)];
+    let dz_l = max(0.0, max(z_l1, max(z_l2, z_l3)) - z_c);
+
+    // Right flank ray sampling
+    let r1 = clamp(i32(round(pos.x + dir_r.x * d1)), 0, max_gx);
+    let r1y = clamp(i32(round(pos.y + dir_r.y * d1)), 0, max_gy);
+    let r2 = clamp(i32(round(pos.x + dir_r.x * d2)), 0, max_gx);
+    let r2y = clamp(i32(round(pos.y + dir_r.y * d2)), 0, max_gy);
+    let r3 = clamp(i32(round(pos.x + dir_r.x * d3)), 0, max_gx);
+    let r3y = clamp(i32(round(pos.y + dir_r.y * d3)), 0, max_gy);
+    let z_r1 = in_z[u32(r1y) * domain.grid_res_x + u32(r1)];
+    let z_r2 = in_z[u32(r2y) * domain.grid_res_x + u32(r2)];
+    let z_r3 = in_z[u32(r3y) * domain.grid_res_x + u32(r3)];
+    let dz_r = max(0.0, max(z_r1, max(z_r2, z_r3)) - z_c);
+
+    // Conical weighted integration: center = 50%, flanks = 25% each
+    let effective_dz = 0.50 * dz_c + 0.25 * dz_l + 0.25 * dz_r;
+
+    // Subtle edge feathering to soften boundary
+    let edge_jitter = 0.04 * sin(0.85 * f32(gx) + 0.72 * f32(gy));
+    let shelter_val = exp(-2.0 * shelter_strength * max(0.0, effective_dz + edge_jitter));
+    return clamp(shelter_val, 0.02, 1.0);
 }
 
 @compute @workgroup_size(16, 16)
@@ -192,6 +325,25 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let denom = h_next * h_next + h_dry * h_dry;
         var raw_u = (h_next * hu_next) / denom;
         var raw_v = (h_next * hv_next) / denom;
+
+        // Aerodynamic wind surface shear stress with divergence-free turbulence & orographic sheltering
+        let mean_wind_speed = params.wind_speed;
+        if (mean_wind_speed > 0.01 && h_next > 0.01) {
+            let mean_dir = vec2<f32>(params.wind_dir_x, params.wind_dir_y);
+            let world_pos = vec2<f32>(f32(x) * dx, f32(y) * dy);
+            let turb_wind = calc_wind_turbulence(world_pos, params.time, mean_dir, mean_wind_speed, params.wind_turbulence);
+
+            // Conical wake plume orographic sheltering with dynamic turbulent meandering
+            let shelter = calc_orographic_shelter_swe(x, y, z_c, dx, turb_wind, params.wind_shelter);
+
+            let eff_wind = turb_wind * shelter;
+            let eff_speed = length(eff_wind);
+            if (eff_speed > 0.01) {
+                let wind_accel = params.wind_drag_coeff * eff_speed * eff_wind / max(h_next, 0.08);
+                raw_u += dt * wind_accel.x;
+                raw_v += dt * wind_accel.y;
+            }
+        }
 
         let raw_speed = sqrt(raw_u * raw_u + raw_v * raw_v);
         let max_speed = 20.0;
